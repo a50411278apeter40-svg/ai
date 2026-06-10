@@ -18,9 +18,36 @@ import { shellQuote, canInlineFallbackFile, buildDefaultActions } from './_tools
 
 const logger = createLogger('chat');
 
-// Prevent SDK stdout observability from crashing the process on EPIPE
+// Prevent SDK observability streams from crashing the process on EPIPE.
+//
+// The Claude Agent SDK spawns internal observability Sockets for telemetry.
+// When the HTTP response stream is closed by the client (or the runtime
+// truncates the pipe), those Sockets emit an unhandled 'error' event with
+// code === 'EPIPE'. Node's default behavior is to crash the process on any
+// unhandled 'error' event, which would tear down the agent runtime. We
+// register defensive listeners at three layers:
+//
+//   1. process.stdout / process.stderr — catches the common case where the
+//      SDK writes directly to stdio (e.g. console.log) after the pipe closes.
+//   2. process.on('uncaughtException') — last-resort net for any internal
+//      SDK Socket whose 'error' event had no handler. EPIPE here is benign
+//      (the client is gone, nothing to write to); anything else is logged
+//      and re-thrown so the runtime's own error handling still runs.
 process.stdout.on('error', (err: any) => {
-  if (err.code === 'EPIPE') return; // ignore broken pipe
+  if (err?.code === 'EPIPE') return;
+});
+process.stderr.on('error', (err: any) => {
+  if (err?.code === 'EPIPE') return;
+});
+process.on('uncaughtException', (err: any) => {
+  if (err?.code === 'EPIPE') {
+    // Client disconnected mid-stream; ignore and keep serving other requests.
+    return;
+  }
+  // Log and re-throw so Node's default behavior (crash + restart) still
+  // applies to real exceptions.
+  console.error('[chat] uncaughtException:', err);
+  throw err;
 });
 
 /** Normalize a string to a valid UUID or return null */
@@ -33,6 +60,15 @@ function normalizeUuid(id: string): string | null {
   return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
 }
 
+/**
+ * Tracks session IDs this worker has already started a CLI session for.
+ * The CLI distinguishes `--session-id` (start new) from `--resume` (continue):
+ * passing `--session-id` for an ID that already exists fails with
+ * "Session ID <id> is already in use" → the subprocess exits 1. So once we
+ * have created a session in this process, every follow-up must `resume` it.
+ */
+const _startedSessions = new Set<string>();
+
 /** Resolve session binding: resume existing session or create new one */
 async function resolveClaudeSessionBinding(
   sessionStore: any,
@@ -41,18 +77,29 @@ async function resolveClaudeSessionBinding(
 ): Promise<{ resume?: string; sessionId?: string }> {
   const sessionId = normalizeUuid(conversationId);
   if (!sessionId) return {};
+
+  // In-process follow-up: this worker already opened the session, so resume it
+  // instead of trying to re-create it (which collides with "already in use").
+  if (_startedSessions.has(sessionId)) {
+    logger.log(`[session] resuming (in-process) session: ${sessionId}`);
+    return { resume: sessionId };
+  }
+
   try {
     const infoOptions: any = { dir: cwd };
     if (sessionStore?.load) infoOptions.sessionStore = sessionStore;
     const info = await getSessionInfo(sessionId, infoOptions);
     if (info) {
       logger.log(`[session] resuming existing session: ${sessionId}`);
+      _startedSessions.add(sessionId);
       return { resume: sessionId };
     }
   } catch {
     // getSessionInfo may throw if session store is unavailable
   }
+
   logger.log(`[session] creating new session: ${sessionId}`);
+  _startedSessions.add(sessionId);
   return { sessionId };
 }
 
@@ -396,12 +443,25 @@ export async function onRequest(context: any) {
   const systemPrompt = buildSystemPrompt(uploadedFiles, sandboxWorking, locale);
 
   // ─── Build query options ──────────────────────────────────────────────────────
+  // The Claude Agent SDK spawns the `claude` CLI subprocess with stderr set to
+  // "ignore" by default — that is why a non-zero exit surfaces as a bare
+  // "Claude Code process exited with code 1" with no detail. Wire `stderr` to
+  // our logger so the real CLI diagnostics (MCP handshake errors, unknown
+  // flags, auth issues, etc.) actually reach the dev terminal.
   const queryOptions: Record<string, any> = {
     model: resolveModelName(ctxEnv),
     systemPrompt,
     cwd,
     tools: [],
-    allowedTools: [...(edgeoneMcp?.allowedTools ?? [])],
+    // Custom tools must be listed by their full `mcp__<server>__<tool>` name so
+    // the model sees them under the correct `custom-tools` prefix. Without this
+    // the model only sees the edgeone sandbox tools and guesses a wrong prefix
+    // (e.g. mcp__edgeone__suggest_actions → "No such tool available").
+    allowedTools: [
+      'mcp__custom-tools__suggest_actions',
+      'mcp__custom-tools__deliver_file',
+      ...(edgeoneMcp?.allowedTools ?? []),
+    ],
     settingSources: ['project'],
     skills: 'all',
     permissionMode: 'bypassPermissions',
@@ -412,6 +472,13 @@ export async function onRequest(context: any) {
     },
     mcpServers,
     abortController,
+    // Capture CLI stderr — required to debug CLI exit-1 errors. See SDK
+    // `spawnLocalProcess`: stderr is "ignore" unless either DEBUG_CLAUDE_AGENT_SDK
+    // is set in env OR this callback is provided.
+    stderr: (data: any) => {
+      const text = typeof data === 'string' ? data : data?.toString?.() || '';
+      if (text.trim()) logger.error('[claude-stderr]', text.trimEnd());
+    },
     ...sessionBinding,
   };
 
@@ -540,10 +607,18 @@ export async function onRequest(context: any) {
     } catch (err: any) {
       logger.error('[query] error:', err);
       if (!signal?.aborted) {
-        yield sseEvent({
-          type: 'text_delta',
-          delta: `\n\n❌ 处理失败: ${err.message || String(err)}`,
-        });
+        // The SDK's bare "Claude Code process exited with code N" message is
+        // intentionally unhelpful because stderr was suppressed inside the SDK.
+        // Our `stderr` option (see queryOptions) forwards the real CLI output
+        // to logger.error — so check the dev terminal / function logs for the
+        // underlying cause (MCP handshake failure, unknown CLI flag, auth
+        // issue, etc.). Surface a short pointer to the user too.
+        const msg: string = err?.message || String(err);
+        const isSubprocessExit = /Claude Code process exited/i.test(msg);
+        const tail = isSubprocessExit
+          ? '\n\nThe full CLI error has been written to the server logs (look for `[claude-stderr]`). On EdgeOne Makers the gateway credentials are injected automatically; for local dev, make sure your .env values are real (not the .env.example placeholders).'
+          : '';
+        yield sseEvent({ type: 'error_message', content: msg + tail });
       }
     }
 

@@ -3,6 +3,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { marked } from 'marked';
 import { useI18n } from '@/lib/i18n';
+import { DeployButtons } from './components/deploy-buttons';
 
 // Configure marked for GFM tables
 marked.setOptions({ gfm: true, breaks: true });
@@ -565,6 +566,11 @@ export default function Home() {
           <div className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-yellow-400 animate-pulse' : 'bg-green-400'}`} />
         </div>
         <div className="flex items-center gap-2">
+          <DeployButtons
+            templateSlug="multimodal-file-assistant-agent"
+            githubUrl="https://github.com/edgeone-pages-test/multimodal-file-assistant-agent"
+            lang={locale}
+          />
           {tokenUsage.input > 0 && (
             <span className={`text-xs px-2 py-1 rounded ${isDark ? 'bg-gray-800 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
               {(tokenUsage.input + tokenUsage.output).toLocaleString()} tokens
