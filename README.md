@@ -58,7 +58,7 @@ Open the local observability dashboard at http://localhost:8080/agent-metrics.
 ## Project Structure
 
 ```
-multimodal-processor-edgeone/
+multimodal-file-assistant-agent/
 ├── agents/
 │   ├── chat/
 │   │   ├── index.ts      # POST /chat — main agent: session mgmt, file upload, SSE loop

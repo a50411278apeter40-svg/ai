@@ -57,7 +57,7 @@ edgeone makers dev
 ## 项目结构
 
 ```
-multimodal-processor-edgeone/
+multimodal-file-assistant-agent/
 ├── agents/
 │   ├── chat/
 │   │   ├── index.ts      # POST /chat —— 主 Agent：会话管理、文件上传、SSE 循环

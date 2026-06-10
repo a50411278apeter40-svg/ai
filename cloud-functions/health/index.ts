@@ -15,7 +15,7 @@ const logger = createLogger('health');
 export async function onRequest(context: any) {
   const data = {
     status: 'ok',
-    service: 'multimodal-processor',
+    service: 'multimodal-file-assistant-agent',
     runId: context.run_id,
     timestamp: new Date().toISOString(),
   };
