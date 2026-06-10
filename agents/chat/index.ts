@@ -79,16 +79,10 @@ export async function onRequest(context: any) {
   }
 
   const signal: AbortSignal | undefined = context.request.signal;
-  // EdgeOne Makers auto-injects context.conversation_id from the `makers-conversation-id` header.
-  // Read the header directly as a defensive fallback for older runtimes.
-  const headerConvId = (() => {
-    try {
-      return context?.request?.headers?.get?.('makers-conversation-id') ?? '';
-    } catch {
-      return '';
-    }
-  })();
-  const conversationId: string = context.conversation_id || headerConvId || '';
+  // EdgeOne Makers auto-injects `context.conversation_id` from the
+  // `makers-conversation-id` HTTP header (SOP platform-conventions §"Headers").
+  // Single channel is enough — no header fallback needed.
+  const conversationId: string = context.conversation_id || '';
   const sandbox = context.sandbox ?? null;
 
   // ─── Session file cache: persist uploaded files across follow-up requests ────
@@ -390,7 +384,10 @@ export async function onRequest(context: any) {
   }
 
   // ─── Session store ────────────────────────────────────────────────────────────
-  const claudeSessionStore = store?.claude_session_store?.() ?? null;
+  // Per SOP H-167, the Claude Agent SDK uses `claudeSessionStore()` (camelCase,
+  // no arguments). The previous snake_case typo always returned undefined and
+  // broke multi-turn session binding.
+  const claudeSessionStore = store?.claudeSessionStore?.() ?? null;
 
   // ─── Session binding (resume vs new) ─────────────────────────────────────────
   const sessionBinding = await resolveClaudeSessionBinding(claudeSessionStore, conversationId, cwd);
