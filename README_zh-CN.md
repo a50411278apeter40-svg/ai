@@ -1,15 +1,10 @@
 # Multimodal Processor（多模态文件处理器）
 
-**语言：** [English](./README.md) | 简体中文
-
 基于 Claude Agent SDK 构建、部署在 EdgeOne Makers 上的 AI 文档处理 Agent，支持图片、PDF、CSV、视频、文本等多种文件的分析与交互式操作。
 
 **Framework:** None (raw Node.js) · **Category:** File Processing · **Language:** TypeScript
 
 [![部署到 EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/makers/new?template=multimodal-file-assistant-agent&from=within&fromAgent=1&agentLang=typescript)
-
-<!-- TODO: confirm -->
-![preview](./assets/preview.png)
 
 ## Overview
 
