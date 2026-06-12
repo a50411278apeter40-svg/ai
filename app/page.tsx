@@ -40,10 +40,17 @@ function MarkdownBlock({ content }: { content: string }) {
 }
 
 function StreamingText({ content, isStreaming }: { content: string; isStreaming: boolean }) {
-  if (isStreaming) {
-    return <pre className="prose-chat whitespace-pre-wrap text-sm font-sans">{content}</pre>;
-  }
-  return <MarkdownBlock content={content} />;
+  // Always render Markdown in real time during streaming — marked.parse is
+  // synchronous so every accumulated delta is parsed immediately.
+  // A pulsing cursor is appended while still streaming.
+  return (
+    <div className="relative">
+      <MarkdownBlock content={content} />
+      {isStreaming && (
+        <span className="inline-block w-1.5 h-4 ml-0.5 align-middle rounded-sm bg-current opacity-60 animate-pulse" />
+      )}
+    </div>
+  );
 }
 
 // ============ Thinking Panel ============
@@ -648,8 +655,11 @@ export default function Home() {
             // ── Thinking group (collapsible) ──
             if (entry.type === 'thinking_group') {
               const steps: ThinkingStep[] = entry.meta?.steps || [];
-              // Hide if no steps and already closed (pure text response, no tool calls)
-              if (steps.length === 0 && !entry.meta?.isLive) return null;
+              // Only show the thinking panel when there is at least one tool
+              // step. Pure text Q&A (no tool calls) should never render the
+              // "Processing.../Waiting for next action..." panel — even while
+              // the run is live — since there is no agent action to show.
+              if (steps.length === 0) return null;
               return (
                 <div key={entry.id} className="flex items-start gap-3 min-w-0 max-w-3xl mx-auto w-full">
                   <span className={`text-[10px] font-mono mt-3 w-14 flex-shrink-0 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>{timeStr(entry.timestamp)}</span>
