@@ -462,13 +462,25 @@ export async function onRequest(context: any) {
       'mcp__custom-tools__deliver_file',
       ...(edgeoneMcp?.allowedTools ?? []),
     ],
-    settingSources: ['project'],
-    skills: 'all',
+    // NOTE: do NOT set settingSources:['project'] / skills:'all' — this project
+    // has NO .claude/ directory (skills are baked into systemPrompt via _skills.ts).
+    // Those options make the claude CLI scan cwd for .claude/settings.json + skills/,
+    // and when missing the CLI subprocess exits silently with zero output even
+    // though the binary itself runs fine. starter works because it HAS .claude/.
     permissionMode: 'bypassPermissions',
     maxTurns: 10,
     env: {
       ...ctxEnv,
       ...collectGatewayEnv(ctxEnv),
+      // ⭐ Required for the claude CLI to run in the serverless runtime:
+      // give it a writable config/tmp dir under /tmp (agent-user has no HOME
+      // beyond /tmp). Without CLAUDE_CONFIG_DIR the CLI can't initialise its
+      // config/session and exits silently with zero output. (Aligned with
+      // claude-agent-starter, which works.)
+      TMPDIR: '/tmp',
+      TMP: '/tmp',
+      TEMP: '/tmp',
+      CLAUDE_CONFIG_DIR: '/tmp/claude-agent-sdk',
     },
     mcpServers,
     abortController,
@@ -601,11 +613,24 @@ export async function onRequest(context: any) {
         } else if (msg.type === 'result') {
           // Drain final queue
           for (const evt of sseQueue.splice(0)) yield evt;
+          // The Claude Agent SDK does NOT throw on model/CLI failures — instead it
+          // emits a result message with `is_error: true` or `subtype !== 'success'`
+          // (e.g. error_max_turns, error_during_execution). Surface it instead of
+          // silently completing with no output.
+          const subtype: string = msg.subtype || '';
+          const isError: boolean = msg.is_error === true || (subtype !== '' && subtype !== 'success');
+          if (isError) {
+            logger.error('[result] error result:', JSON.stringify(msg).slice(0, 800));
+            if (!fullAssistantText && !signal?.aborted) {
+              const detail = (typeof msg.result === 'string' && msg.result) || subtype || 'unknown error';
+              yield sseEvent({ type: 'error_message', content: `Model run failed (${subtype || 'error'}): ${detail}` });
+            }
+          }
           break;
         }
       }
     } catch (err: any) {
-      logger.error('[query] error:', err);
+      logger.error('[query] error:', err?.stack || err);
       if (!signal?.aborted) {
         // The SDK's bare "Claude Code process exited with code N" message is
         // intentionally unhelpful because stderr was suppressed inside the SDK.
