@@ -543,7 +543,7 @@ export async function onRequest(context: any) {
   // our logger so the real CLI diagnostics (MCP handshake errors, unknown
   // flags, auth issues, etc.) actually reach the dev terminal.
   const queryOptions: Record<string, any> = {
-    model: resolveModelName(),
+    model: resolveModelName(ctxEnv),
     systemPrompt,
     cwd,
     tools: [],
