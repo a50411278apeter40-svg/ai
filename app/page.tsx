@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef, useEffect } from 'react';
+import Link from 'next/link';
 import { marked } from 'marked';
 import { useI18n } from '@/lib/i18n';
 import { DeployButtons } from './components/deploy-buttons';
@@ -42,6 +43,38 @@ interface ChatMessage {
   fileDownloads?: Array<{ path: string; filename: string }>;
   isStreaming: boolean;
   thinkingLevel: ThinkingLevel;
+}
+
+/** Logged-in user (no real auth — just stored profile info) */
+interface StoredUser {
+  id: string;
+  email: string;
+  username: string;
+  name: string;
+}
+
+/** Generate a conversation id that satisfies EdgeOne Makers'
+ * `makers-conversation-id` header requirement (6-36 chars, [0-9a-zA-Z-_.]) */
+function generateConversationId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let id = '';
+  for (let i = 0; i < 32; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
+}
+
+function getOrCreateConversationId(): string {
+  if (typeof window === 'undefined') return generateConversationId();
+  let id = localStorage.getItem('pixal_conversation_id');
+  if (!id) {
+    id = generateConversationId();
+    localStorage.setItem('pixal_conversation_id', id);
+  }
+  return id;
 }
 
 // ============ Markdown Renderer ============
@@ -371,6 +404,8 @@ export default function HomePage() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>('medium');
+  const [user, setUser] = useState<StoredUser | null>(null);
+  const [conversationId, setConversationId] = useState<string>('');
   const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -384,6 +419,20 @@ export default function HomePage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
+
+  // Load logged-in user + persistent conversation id on mount
+  useEffect(() => {
+    setConversationId(getOrCreateConversationId());
+    try {
+      const raw = localStorage.getItem('pixal_user');
+      if (raw) setUser(JSON.parse(raw));
+    } catch {}
+  }, []);
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('pixal_user');
+    setUser(null);
+  }, []);
 
   // Handle file selection
   const handleFileSelect = useCallback(async (selectedFiles: FileList | null) => {
@@ -491,13 +540,23 @@ export default function HomePage() {
         base64: f.base64 || '',
       }));
 
+      // EdgeOne Makers requires a valid `makers-conversation-id` header
+      // (6-36 chars, [0-9a-zA-Z-_.]) on every Agent request.
+      const cid = conversationId || getOrCreateConversationId();
+
       const response = await fetch('/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'makers-conversation-id': cid,
+        },
         body: JSON.stringify({
           message: userMessage,
           files: apiFiles,
           thinkingLevel,
+          // Only sent when logged in — backend only auto-saves history
+          // to context.store when a userId is present.
+          userId: user?.id,
         }),
         signal: controller.signal,
       });
@@ -637,7 +696,7 @@ export default function HomePage() {
       setIsProcessing(false);
       abortRef.current = null;
     }
-  }, [input, files, isProcessing, thinkingLevel, messages]);
+  }, [input, files, isProcessing, thinkingLevel, messages, conversationId, user]);
 
   // Stop processing
   const stopProcessing = useCallback(() => {
@@ -649,6 +708,10 @@ export default function HomePage() {
   const clearChat = useCallback(() => {
     setMessages([]);
     setFiles([]);
+    // Start a brand-new conversation (new id) so history stays separated
+    const newId = generateConversationId();
+    localStorage.setItem('pixal_conversation_id', newId);
+    setConversationId(newId);
   }, []);
 
   return (
@@ -671,6 +734,41 @@ export default function HomePage() {
             onChange={setThinkingLevel}
             isDark={isDark}
           />
+
+          {/* Auth status */}
+          {user ? (
+            <div className="flex items-center gap-2">
+              <span className={`text-xs font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                👋 {user.name}
+              </span>
+              <button
+                onClick={logout}
+                className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors ${
+                  isDark ? 'bg-gray-800 hover:bg-gray-700 text-gray-300' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                }`}
+              >
+                로그아웃
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <Link
+                href="/login"
+                className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors ${
+                  isDark ? 'bg-gray-800 hover:bg-gray-700 text-gray-300' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                }`}
+              >
+                로그인
+              </Link>
+              <Link
+                href="/signup"
+                className="text-xs px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              >
+                회원가입
+              </Link>
+            </div>
+          )}
+
           <DeployButtons
             templateSlug="pixal2-agent"
             githubUrl="https://github.com/a50411278apeter40-svg/ai"
@@ -678,6 +776,17 @@ export default function HomePage() {
           />
         </div>
       </header>
+
+      {/* Save status banner */}
+      {user ? (
+        <div className={`px-4 py-1.5 text-[11px] text-center flex-shrink-0 ${isDark ? 'bg-green-950/30 text-green-400' : 'bg-green-50 text-green-700'}`}>
+          🟢 로그인됨 — 대화 기록(도구 사용 내역 포함)이 실시간으로 자동 저장됩니다.
+        </div>
+      ) : (
+        <div className={`px-4 py-1.5 text-[11px] text-center flex-shrink-0 ${isDark ? 'bg-gray-900 text-gray-500' : 'bg-gray-50 text-gray-400'}`}>
+          ⚪ 로그인하지 않으면 대화 기록이 저장되지 않습니다. <Link href="/login" className="underline">로그인</Link>
+        </div>
+      )}
 
       {/* Chat Area */}
       <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">

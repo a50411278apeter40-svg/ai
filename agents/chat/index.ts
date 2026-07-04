@@ -7,6 +7,11 @@
  * Custom agent loop with tool calling, streaming, and multimodal support.
  *
  * File path: agents/chat/index.ts → maps to **POST /chat**
+ *
+ * Conversation logging: every event (user message, thinking steps, tool
+ * calls, tool outputs, final response) is appended in real time via
+ * context.store.appendMessage — but ONLY when the request includes a
+ * logged-in userId. This matches the "save only when logged in" requirement.
  */
 
 import {
@@ -50,7 +55,6 @@ function parseToolCalls(text: string): { plainText: string; toolCalls: ToolCall[
   const toolCalls: ToolCall[] = [];
   let plainText = text;
 
-  // Match ```tool ... ``` blocks
   const toolBlockRegex = /```tool\s*\n?([\s\S]*?)```/g;
   let match;
   while ((match = toolBlockRegex.exec(text)) !== null) {
@@ -62,7 +66,6 @@ function parseToolCalls(text: string): { plainText: string; toolCalls: ToolCall[
     } catch {}
   }
 
-  // Also try inline JSON tool format: {"tool": "...", "arguments": {...}}
   if (toolCalls.length === 0) {
     const inlineRegex = /\{"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}/g;
     while ((match = inlineRegex.exec(text)) !== null) {
@@ -75,7 +78,6 @@ function parseToolCalls(text: string): { plainText: string; toolCalls: ToolCall[
     }
   }
 
-  // Remove tool blocks from plain text
   plainText = text.replace(toolBlockRegex, '').trim();
 
   return { plainText, toolCalls };
@@ -86,7 +88,6 @@ function extractThinking(text: string): { thinking: string; response: string } {
   let thinking = '';
   let response = text;
 
-  // Match <think>...</think> tags
   const thinkRegex = /<think>\s*\n?([\s\S]*?)\n?<\/think>/g;
   const match = thinkRegex.exec(text);
   if (match) {
@@ -234,6 +235,11 @@ export async function onRequest(context: any) {
   const uploadedFiles: Array<{ name: string; base64: string }> = body.files ?? [];
   const thinkingLevel: ThinkingLevel = (body.thinkingLevel as ThinkingLevel) || 'medium';
 
+  // Only present when the user is logged in on the frontend — controls
+  // whether this conversation gets auto-saved via context.store.
+  const userId: string | undefined =
+    typeof body.userId === 'string' && body.userId.trim() ? body.userId.trim() : undefined;
+
   if (!message) {
     return new Response(JSON.stringify({ error: "'message' is required" }), {
       status: 400,
@@ -242,6 +248,8 @@ export async function onRequest(context: any) {
   }
 
   const signal: AbortSignal | undefined = context.request.signal;
+  // EdgeOne Makers requires a valid `makers-conversation-id` header
+  // (6-36 chars, [0-9a-zA-Z-_.]) — the frontend generates and persists one.
   const conversationId: string = context.conversation_id || '';
   const sandbox = context.sandbox ?? null;
   const hfToken = getHFToken(ctxEnv);
@@ -268,14 +276,64 @@ export async function onRequest(context: any) {
     : cachedFiles;
 
   logger.log(
-    `[request] cid=${conversationId}, msg="${message.slice(0, 80)}...", files=${filesToUpload.length}, thinking=${thinkingLevel}`
+    `[request] cid=${conversationId}, msg="${message.slice(0, 80)}...", files=${filesToUpload.length}, thinking=${thinkingLevel}, userId=${userId ?? 'none'}`
   );
 
+  // ─── Conversation storage: only active when logged in ───
+  const storeAvailable = Boolean(context.store && typeof context.store.appendMessage === 'function');
+  const saveEnabled = Boolean(userId) && storeAvailable;
+
+  const logMessage = (
+    role: 'user' | 'assistant' | 'system' | 'tool',
+    content: string,
+    metadata?: Record<string, any>
+  ) => {
+    if (!saveEnabled || !conversationId) return;
+    try {
+      const p = Promise.resolve(
+        context.store.appendMessage({
+          conversationId,
+          role,
+          content,
+          userId,
+          metadata,
+        })
+      ).catch((e: any) => logger.error('[store] appendMessage failed:', e?.message));
+      if (typeof context.waitUntil === 'function') {
+        context.waitUntil(p);
+      }
+    } catch (e) {
+      logger.error('[store] appendMessage threw:', (e as Error).message);
+    }
+  };
+
+  // Keep conversation metadata (title, last activity) up to date
+  if (saveEnabled && typeof context.store.updateConversation === 'function') {
+    try {
+      const p = Promise.resolve(
+        context.store.updateConversation({
+          conversationId,
+          userId,
+          title: message.slice(0, 60),
+        })
+      ).catch(() => {});
+      if (typeof context.waitUntil === 'function') context.waitUntil(p);
+    } catch {}
+  }
+
   return createSSEResponse(async function* (signal) {
+    // Log the incoming user message + attached files immediately
+    logMessage('user', message, {
+      type: 'user_message',
+      files: filesToUpload.map(f => f.name),
+      thinkingLevel,
+    });
+
     // 1. Sandbox setup — install packages & make writable
     let sandboxWorking = false;
     if (sandbox) {
       yield sseEvent({ type: 'thinking_start', content: '샌드박스 환경 준비 중...' });
+      logMessage('system', '샌드박스 환경 준비 중...', { type: 'phase' });
 
       if (conversationId && _sessionSandboxSetup.has(conversationId)) {
         sandboxWorking = true;
@@ -285,11 +343,14 @@ export async function onRequest(context: any) {
           sandboxWorking = true;
 
           yield sseEvent({ type: 'thinking_content', content: '패키지 설치 및 파일 시스템 설정 중...' });
+          logMessage('system', '패키지 설치 및 파일 시스템 설정 중...', { type: 'phase' });
+
           const setupOk = await setupSandbox(sandbox);
           if (setupOk && conversationId) {
             _sessionSandboxSetup.add(conversationId);
           }
           yield sseEvent({ type: 'thinking_content', content: '샌드박스 준비 완료.' });
+          logMessage('system', '샌드박스 준비 완료.', { type: 'phase' });
         } catch {
           for (let attempt = 0; attempt < 2; attempt++) {
             await new Promise(r => setTimeout(r, 2000));
@@ -297,6 +358,7 @@ export async function onRequest(context: any) {
               await sandbox.commands.run('ls /tmp', { timeout: 10 });
               sandboxWorking = true;
               yield sseEvent({ type: 'thinking_content', content: `샌드박스 준비 완료 (재시도 ${attempt + 1}).` });
+              logMessage('system', `샌드박스 준비 완료 (재시도 ${attempt + 1}).`, { type: 'phase' });
               break;
             } catch {}
           }
@@ -310,10 +372,9 @@ export async function onRequest(context: any) {
       yield sseEvent({ type: 'thinking_start', content: '파일 업로드 중...' });
       for (const file of filesToUpload) {
         const ok = await uploadFileToSandbox(sandbox, file);
-        yield sseEvent({
-          type: 'thinking_content',
-          content: ok ? `파일 업로드 완료: ${file.name}` : `파일 업로드 실패: ${file.name}`,
-        });
+        const msg = ok ? `파일 업로드 완료: ${file.name}` : `파일 업로드 실패: ${file.name}`;
+        yield sseEvent({ type: 'thinking_content', content: msg });
+        logMessage('system', msg, { type: 'file_upload', file: file.name, success: ok });
       }
       yield sseEvent({ type: 'thinking_end' });
     }
@@ -330,6 +391,7 @@ export async function onRequest(context: any) {
         const analysis = await processMultimodalInSandbox(sandbox, file.name, fileType);
         multimodalContext += `\n\n[File: ${file.name} (${fileType})]\n${analysis}`;
         yield sseEvent({ type: 'thinking_content', content: `${file.name} 분석 완료` });
+        logMessage('system', analysis, { type: 'multimodal_analysis', file: file.name, fileType });
       }
       yield sseEvent({ type: 'thinking_end' });
     }
@@ -352,20 +414,17 @@ export async function onRequest(context: any) {
 
     while (iteration < config.maxIterations) {
       iteration++;
-      yield sseEvent({
-        type: 'thinking_start',
-        content: `생각 중... (단계 ${iteration}/${config.maxIterations})`,
-      });
+      const iterMsg = `생각 중... (단계 ${iteration}/${config.maxIterations})`;
+      yield sseEvent({ type: 'thinking_start', content: iterMsg });
+      logMessage('assistant', iterMsg, { type: 'thinking', iteration });
 
       let rawResponse = '';
 
       try {
         if (localMode && sandboxWorking) {
-          // Direct model download & inference in sandbox (Python transformers)
           rawResponse = await runLocalModel(sandbox, messages, thinkingLevel, signal);
           yield sseEvent({ type: 'text_chunk', content: rawResponse });
         } else {
-          // HF Inference API with streaming
           for await (const chunk of callHFModel(messages, hfToken, thinkingLevel, signal)) {
             rawResponse += chunk;
             yield sseEvent({ type: 'text_chunk', content: chunk });
@@ -375,21 +434,25 @@ export async function onRequest(context: any) {
         const err = e as Error;
         logger.error(`[model] iteration ${iteration} error:`, err.message);
 
-        // Fallback: local → API
         if (localMode && sandboxWorking && hfToken) {
           yield sseEvent({ type: 'thinking_content', content: '로컬 모델 실패, HF API로 전환 중...' });
+          logMessage('system', '로컬 모델 실패, HF API로 전환 중...', { type: 'phase' });
           try {
             for await (const chunk of callHFModel(messages, hfToken, thinkingLevel, signal)) {
               rawResponse += chunk;
               yield sseEvent({ type: 'text_chunk', content: chunk });
             }
           } catch (e2) {
-            yield sseEvent({ type: 'error_message', content: `모델 호출 실패: ${(e2 as Error).message}` });
+            const errMsg = `모델 호출 실패: ${(e2 as Error).message}`;
+            yield sseEvent({ type: 'error_message', content: errMsg });
+            logMessage('system', errMsg, { type: 'error' });
             yield sseEvent({ type: 'thinking_end' });
             break;
           }
         } else {
-          yield sseEvent({ type: 'error_message', content: `모델 호출 실패: ${err.message}` });
+          const errMsg = `모델 호출 실패: ${err.message}`;
+          yield sseEvent({ type: 'error_message', content: errMsg });
+          logMessage('system', errMsg, { type: 'error' });
           yield sseEvent({ type: 'thinking_end' });
           break;
         }
@@ -405,6 +468,7 @@ export async function onRequest(context: any) {
       const { thinking, response } = extractThinking(rawResponse);
       if (thinking) {
         yield sseEvent({ type: 'thinking_content', content: thinking });
+        logMessage('assistant', thinking, { type: 'thinking', iteration });
       }
 
       // Parse tool calls
@@ -423,6 +487,11 @@ export async function onRequest(context: any) {
           tool: toolCall.tool,
           arguments: toolCall.arguments,
         });
+        logMessage('tool', JSON.stringify({ tool: toolCall.tool, arguments: toolCall.arguments }), {
+          type: 'tool_call',
+          tool: toolCall.tool,
+          arguments: toolCall.arguments,
+        });
 
         const result = await executeTool(toolCall, sandboxWorking ? sandbox : null);
 
@@ -432,6 +501,11 @@ export async function onRequest(context: any) {
           output: result.output,
           success: result.success,
         });
+        logMessage('tool', result.output, {
+          type: 'tool_output',
+          tool: toolCall.tool,
+          success: result.success,
+        });
 
         if (result.file) {
           yield sseEvent({
@@ -439,6 +513,7 @@ export async function onRequest(context: any) {
             path: result.file,
             filename: result.file.split('/').pop() || 'file',
           });
+          logMessage('system', `파일 생성됨: ${result.file}`, { type: 'file_download', path: result.file });
         }
 
         // Feed tool result back to model
@@ -450,7 +525,10 @@ export async function onRequest(context: any) {
       }
     }
 
-    // 6. Done
+    // 6. Done — log the final assistant response
     yield sseEvent({ type: 'done', content: finalResponse });
+    if (finalResponse) {
+      logMessage('assistant', finalResponse, { type: 'final' });
+    }
   }, signal);
 }
