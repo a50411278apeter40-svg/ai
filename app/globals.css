@@ -17,6 +17,22 @@ body {
   color: var(--foreground);
 }
 
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 100, 100, 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 100, 100, 0.5);
+}
+
 @layer components {
   /* Dark theme prose */
   .dark .prose-chat h1 { @apply text-lg font-bold text-gray-100 mb-2 mt-3; }
@@ -57,4 +73,15 @@ body {
   .light .prose-chat td { @apply border border-gray-200 px-2 py-1 text-gray-600; }
   .light .prose-chat hr { @apply my-3 border-gray-200; }
   .light .prose-chat a { @apply text-blue-600 underline hover:text-blue-700; }
+
+  /* Accordion animations */
+  .accordion-content {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease-out;
+  }
+  .accordion-content.expanded {
+    max-height: 500px;
+    transition: max-height 0.3s ease-in;
+  }
 }

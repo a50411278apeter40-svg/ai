@@ -8,6 +8,6 @@
     }
   },
   "agents": {
-    "framework": "claude-agent-sdk"
+    "framework": "custom"
   }
 }

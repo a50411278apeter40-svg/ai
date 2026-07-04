@@ -1,0 +1,29 @@
+# PIXAL 2.0 Sandbox Requirements
+# These packages are installed in the EdgeOne sandbox
+transformers
+huggingface_hub
+torch
+accelerate
+Pillow
+opencv-python-headless
+pandas
+openpyxl
+PyPDF2
+pdfplumber
+python-docx
+fpdf2
+matplotlib
+numpy
+scipy
+scikit-learn
+librosa
+soundfile
+beautifulsoup4
+qrcode
+pydub
+openai-whisper
+sentencepiece
+protobuf
+einops
+bitsandbytes
+requests

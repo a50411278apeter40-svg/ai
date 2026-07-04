@@ -1,832 +1,456 @@
 /**
- * Document Processing Agent — EdgeOne Makers Functions
- * ====================================================
+ * PIXAL2.0 Agent Handler — EdgeOne Makers Functions
+ * ==================================================
+ *
+ * Uses HuggingFace google/gemma-4-E2B-it-assistant model directly.
+ * NO @anthropic-ai/claude-agent-sdk, NO transformers.js.
+ * Custom agent loop with tool calling, streaming, and multimodal support.
  *
  * File path: agents/chat/index.ts → maps to **POST /chat**
- *
- * Uses @anthropic-ai/claude-agent-sdk with dual MCP server pattern:
- *   1. EdgeOne sandbox MCP server  — code_interpreter, commands, files
- *   2. Custom tools MCP server     — suggest_actions, deliver_file
  */
 
 import {
-  query,
-  createSdkMcpServer,
-  getSessionInfo,
-} from "@anthropic-ai/claude-agent-sdk";
-import { z } from "zod";
-import { resolveModelName, collectGatewayEnv } from "../_model";
-import { createLogger, sseEvent, createSSEResponse } from "../_shared";
+  HF_MODEL_ID,
+  getChatCompletionsURL,
+  getHFToken,
+  THINKING_CONFIGS,
+  ThinkingLevel,
+  isLocalMode,
+} from "../_model";
 import { buildSystemPrompt } from "./_skills";
 import {
+  executeTool,
+  uploadFileToSandbox,
+  setupSandbox,
+  processMultimodalInSandbox,
+  getFileType,
+  isMultimodal,
+  ToolCall,
   shellQuote,
-  canInlineFallbackFile,
-  buildDefaultActions,
 } from "./_tools";
+import { createLogger, sseEvent, createSSEResponse } from "../_shared";
 
 const logger = createLogger("chat");
 
-// Prevent SDK observability streams from crashing the process on EPIPE.
-//
-// The Claude Agent SDK spawns internal observability Sockets for telemetry.
-// When the HTTP response stream is closed by the client (or the runtime
-// truncates the pipe), those Sockets emit an unhandled 'error' event with
-// code === 'EPIPE'. Node's default behavior is to crash the process on any
-// unhandled 'error' event, which would tear down the agent runtime. We
-// register defensive listeners at three layers:
-//
-//   1. process.stdout / process.stderr — catches the common case where the
-//      SDK writes directly to stdio (e.g. console.log) after the pipe closes.
-//   2. process.on('uncaughtException') — last-resort net for any internal
-//      SDK Socket whose 'error' event had no handler. EPIPE here is benign
-//      (the client is gone, nothing to write to); anything else is logged
-//      and re-thrown so the runtime's own error handling still runs.
-process.stdout.on("error", (err: any) => {
+// EPIPE guard
+process.stdout?.on?.("error", (err: any) => {
   if (err?.code === "EPIPE") return;
 });
-process.stderr.on("error", (err: any) => {
+process.stderr?.on?.("error", (err: any) => {
   if (err?.code === "EPIPE") return;
 });
 process.on("uncaughtException", (err: any) => {
-  if (err?.code === "EPIPE") {
-    // Client disconnected mid-stream; ignore and keep serving other requests.
-    return;
-  }
-  // Log and re-throw so Node's default behavior (crash + restart) still
-  // applies to real exceptions.
+  if (err?.code === "EPIPE") return;
   console.error("[chat] uncaughtException:", err);
   throw err;
 });
 
-/** Normalize a string to a valid UUID or return null */
-function normalizeUuid(id: string): string | null {
-  if (!id) return null;
-  const uuidRe =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (uuidRe.test(id)) return id.toLowerCase();
-  // Pad/truncate to a pseudo-UUID so sessions can be keyed by conversationId
-  const hex = id
-    .replace(/[^0-9a-f]/gi, "")
-    .padEnd(32, "0")
-    .slice(0, 32);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
-    12,
-    16
-  )}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
+/** Parse tool calls from model response text */
+function parseToolCalls(text: string): { plainText: string; toolCalls: ToolCall[] } {
+  const toolCalls: ToolCall[] = [];
+  let plainText = text;
 
-/**
- * Tracks session IDs this worker has already started a CLI session for.
- * The CLI distinguishes `--session-id` (start new) from `--resume` (continue):
- * passing `--session-id` for an ID that already exists fails with
- * "Session ID <id> is already in use" → the subprocess exits 1. So once we
- * have created a session in this process, every follow-up must `resume` it.
- */
-const _startedSessions = new Set<string>();
-
-/** Resolve session binding: resume existing session or create new one */
-async function resolveClaudeSessionBinding(
-  sessionStore: any,
-  conversationId: string,
-  cwd: string
-): Promise<{ resume?: string; sessionId?: string }> {
-  const sessionId = normalizeUuid(conversationId);
-  if (!sessionId) return {};
-
-  // In-process follow-up: this worker already opened the session, so resume it
-  // instead of trying to re-create it (which collides with "already in use").
-  if (_startedSessions.has(sessionId)) {
-    logger.log(`[session] resuming (in-process) session: ${sessionId}`);
-    return { resume: sessionId };
+  // Match ```tool ... ``` blocks
+  const toolBlockRegex = /```tool\s*\n?([\s\S]*?)```/g;
+  let match;
+  while ((match = toolBlockRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.tool) {
+        toolCalls.push({ tool: parsed.tool, arguments: parsed.arguments || {} });
+      }
+    } catch {}
   }
 
-  try {
-    const infoOptions: any = { dir: cwd };
-    if (sessionStore?.load) infoOptions.sessionStore = sessionStore;
-    const info = await getSessionInfo(sessionId, infoOptions);
-    if (info) {
-      logger.log(`[session] resuming existing session: ${sessionId}`);
-      _startedSessions.add(sessionId);
-      return { resume: sessionId };
+  // Also try inline JSON tool format: {"tool": "...", "arguments": {...}}
+  if (toolCalls.length === 0) {
+    const inlineRegex = /\{"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\}/g;
+    while ((match = inlineRegex.exec(text)) !== null) {
+      try {
+        toolCalls.push({
+          tool: match[1],
+          arguments: JSON.parse(match[2]),
+        });
+      } catch {}
     }
-  } catch {
-    // getSessionInfo may throw if session store is unavailable
   }
 
-  logger.log(`[session] creating new session: ${sessionId}`);
-  _startedSessions.add(sessionId);
-  return { sessionId };
+  // Remove tool blocks from plain text
+  plainText = text.replace(toolBlockRegex, '').trim();
+
+  return { plainText, toolCalls };
 }
 
-/** In-process file cache: persists uploaded files across follow-up requests within same process */
-const _sessionFileCache = new Map<
-  string,
-  Array<{ name: string; base64: string }>
->();
+/** Extract thinking content from <think> tags */
+function extractThinking(text: string): { thinking: string; response: string } {
+  let thinking = '';
+  let response = text;
+
+  // Match <think>...</think> tags
+  const thinkRegex = /<think>\s*\n?([\s\S]*?)\n?<\/think>/g;
+  const match = thinkRegex.exec(text);
+  if (match) {
+    thinking = match[1].trim();
+    response = text.replace(thinkRegex, '').trim();
+  }
+
+  return { thinking, response };
+}
+
+/** Call HuggingFace Inference API with streaming */
+async function* callHFModel(
+  messages: Array<{ role: string; content: string }>,
+  apiKey: string,
+  thinkingLevel: ThinkingLevel,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const config = THINKING_CONFIGS[thinkingLevel];
+  const url = getChatCompletionsURL();
+
+  const body: Record<string, any> = {
+    model: HF_MODEL_ID,
+    messages,
+    stream: true,
+    max_tokens: config.maxTokens,
+    temperature: config.temperature,
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => response.statusText);
+    throw new Error(`HF API error ${response.status}: ${errText}`);
+  }
+
+  if (!response.body) {
+    throw new Error('No response body from HF API');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (signal?.aborted) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+      const data = trimmed.slice(6);
+      if (data === '[DONE]') return;
+      try {
+        const parsed = JSON.parse(data);
+        const content = parsed.choices?.[0]?.delta?.content || '';
+        if (content) yield content;
+      } catch {}
+    }
+  }
+}
+
+/** Run model locally in sandbox via Python transformers (direct download) */
+async function runLocalModel(
+  sandbox: any,
+  messages: Array<{ role: string; content: string }>,
+  thinkingLevel: ThinkingLevel,
+  signal?: AbortSignal
+): Promise<string> {
+  const config = THINKING_CONFIGS[thinkingLevel];
+  const messagesJson = JSON.stringify(messages);
+
+  const code = `
+import json, sys
+messages = ${messagesJson}
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import torch
+
+    model_id = "${HF_MODEL_ID}"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=${config.maxTokens},
+        temperature=${config.temperature},
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    input_len = inputs["input_ids"].shape[1]
+    response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    print(response)
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
+`;
+
+  if (sandbox?.runCode) {
+    const result = await sandbox.runCode(code, { language: 'python' });
+    return result.stdout || result.stderr || '';
+  } else if (sandbox?.commands) {
+    const tmpFile = '/tmp/__pixal_run.py';
+    await sandbox.files?.write(tmpFile, code);
+    const r = await sandbox.commands.run(`python3 ${tmpFile}`, { timeout: 300 });
+    return r.stdout || r.stderr || '';
+  }
+
+  throw new Error('No sandbox code execution available for local model');
+}
+
+/** In-process file cache for session persistence */
+const _sessionFileCache = new Map<string, Array<{ name: string; base64: string }>>();
+
+/** Session sandbox setup tracking */
+const _sessionSandboxSetup = new Set<string>();
 
 export async function onRequest(context: any) {
   const ctxEnv: Record<string, string | undefined> = context.env ?? process.env;
-
   const body = context.request.body ?? {};
-  let message = typeof body.message === "string" ? body.message.trim() : "";
-  const uploadedFiles: Array<{ name: string; base64: string }> =
-    body.files ?? [];
 
-  // Detect user locale from the language hint appended by the frontend
-  const locale: "zh" | "en" = message.includes("[语言要求：")
-    ? "zh"
-    : message.includes("[Language:")
-    ? "en"
-    : "en";
+  let message = typeof body.message === 'string' ? body.message.trim() : '';
+  const uploadedFiles: Array<{ name: string; base64: string }> = body.files ?? [];
+  const thinkingLevel: ThinkingLevel = (body.thinkingLevel as ThinkingLevel) || 'medium';
 
   if (!message) {
     return new Response(JSON.stringify({ error: "'message' is required" }), {
       status: 400,
-      headers: { "Content-Type": "application/json" },
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 
   const signal: AbortSignal | undefined = context.request.signal;
-  // EdgeOne Makers auto-injects `context.conversation_id` from the
-  // `makers-conversation-id` HTTP header.
-  const conversationId: string = context.conversation_id || "";
+  const conversationId: string = context.conversation_id || '';
   const sandbox = context.sandbox ?? null;
+  const hfToken = getHFToken(ctxEnv);
+  const localMode = isLocalMode(ctxEnv);
 
-  // ─── Session file cache: persist uploaded files across follow-up requests ────
-  // The EdgeOne sandbox /tmp/ is ephemeral — re-upload cached files on every request.
-  const cachedSessionFiles: Array<{ name: string; base64: string }> =
-    conversationId ? _sessionFileCache.get(conversationId) ?? [] : [];
+  if (!hfToken && !localMode) {
+    return new Response(
+      JSON.stringify({
+        error: 'HUGGING_FACE_HUB_TOKEN is required. Set it in your EdgeOne environment variables.',
+      }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
 
+  // Session file cache
+  const cachedFiles = conversationId ? _sessionFileCache.get(conversationId) ?? [] : [];
   if (conversationId && uploadedFiles.length > 0) {
-    // Merge new files with cached ones (new files override existing with same name)
-    const mergedMap = new Map(cachedSessionFiles.map((f) => [f.name, f]));
-    uploadedFiles.forEach((f) => mergedMap.set(f.name, f));
+    const mergedMap = new Map(cachedFiles.map(f => [f.name, f]));
+    uploadedFiles.forEach(f => mergedMap.set(f.name, f));
     _sessionFileCache.set(conversationId, Array.from(mergedMap.values()));
   }
-
-  // On follow-up requests (no new files), re-upload all cached files to the (possibly fresh) sandbox
-  const filesToUpload: Array<{ name: string; base64: string }> =
-    uploadedFiles.length > 0
-      ? _sessionFileCache.get(conversationId) ?? uploadedFiles
-      : cachedSessionFiles;
-  const store = context.store ?? null;
-  const cwd = process.cwd();
+  const filesToUpload = uploadedFiles.length > 0
+    ? _sessionFileCache.get(conversationId) ?? uploadedFiles
+    : cachedFiles;
 
   logger.log(
-    `[request] cid=${conversationId}, message="${message.slice(
-      0,
-      80
-    )}...", files=${uploadedFiles.length}`
+    `[request] cid=${conversationId}, msg="${message.slice(0, 80)}...", files=${filesToUpload.length}, thinking=${thinkingLevel}`
   );
 
-  // ─── Sandbox readiness check ────────────────────────────────────────────────
-  let sandboxWorking = false;
+  return createSSEResponse(async function* (signal) {
+    // 1. Sandbox setup — install packages & make writable
+    let sandboxWorking = false;
+    if (sandbox) {
+      yield sseEvent({ type: 'thinking_start', content: '샌드박스 환경 준비 중...' });
 
-  if (sandbox) {
-    try {
-      await sandbox.commands.run("ls /tmp", { timeout: 10 });
-      sandboxWorking = true;
-      logger.log("[sandbox] ready");
-    } catch {
-      // Retry with delay (sandbox may be cold-starting)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        await new Promise((r) => setTimeout(r, 2000));
+      if (conversationId && _sessionSandboxSetup.has(conversationId)) {
+        sandboxWorking = true;
+      } else {
         try {
-          await sandbox.commands.run("ls /tmp", { timeout: 10 });
+          await sandbox.commands.run('ls /tmp', { timeout: 10 });
           sandboxWorking = true;
-          logger.log(`[sandbox] ready (after ${attempt + 1} retries)`);
-          break;
+
+          yield sseEvent({ type: 'thinking_content', content: '패키지 설치 및 파일 시스템 설정 중...' });
+          const setupOk = await setupSandbox(sandbox);
+          if (setupOk && conversationId) {
+            _sessionSandboxSetup.add(conversationId);
+          }
+          yield sseEvent({ type: 'thinking_content', content: '샌드박스 준비 완료.' });
         } catch {
-          logger.log(
-            `[sandbox] not ready, retrying... (attempt ${attempt + 1})`
-          );
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              await sandbox.commands.run('ls /tmp', { timeout: 10 });
+              sandboxWorking = true;
+              yield sseEvent({ type: 'thinking_content', content: `샌드박스 준비 완료 (재시도 ${attempt + 1}).` });
+              break;
+            } catch {}
+          }
         }
       }
+      yield sseEvent({ type: 'thinking_end' });
     }
-  }
 
-  // ─── Write uploaded files to sandbox ────────────────────────────────────────
-  if (sandboxWorking && filesToUpload.length > 0) {
-    for (const file of filesToUpload) {
+    // 2. Upload files to sandbox
+    if (sandboxWorking && filesToUpload.length > 0) {
+      yield sseEvent({ type: 'thinking_start', content: '파일 업로드 중...' });
+      for (const file of filesToUpload) {
+        const ok = await uploadFileToSandbox(sandbox, file);
+        yield sseEvent({
+          type: 'thinking_content',
+          content: ok ? `파일 업로드 완료: ${file.name}` : `파일 업로드 실패: ${file.name}`,
+        });
+      }
+      yield sseEvent({ type: 'thinking_end' });
+    }
+
+    // 3. Process multimodal files (image, video, audio) in Python
+    let multimodalContext = '';
+    const multimodalFiles = filesToUpload.filter(f => isMultimodal(getFileType(f.name)));
+
+    if (sandboxWorking && multimodalFiles.length > 0) {
+      yield sseEvent({ type: 'thinking_start', content: '멀티모달 파일 분석 중 (Python)...' });
+      for (const file of multimodalFiles) {
+        const fileType = getFileType(file.name);
+        yield sseEvent({ type: 'thinking_content', content: `${fileType} 파일 처리 중: ${file.name}` });
+        const analysis = await processMultimodalInSandbox(sandbox, file.name, fileType);
+        multimodalContext += `\n\n[File: ${file.name} (${fileType})]\n${analysis}`;
+        yield sseEvent({ type: 'thinking_content', content: `${file.name} 분석 완료` });
+      }
+      yield sseEvent({ type: 'thinking_end' });
+    }
+
+    // 4. Build messages
+    const hasFiles = filesToUpload.length > 0;
+    const hasMultimodal = multimodalFiles.length > 0;
+    const systemPrompt = buildSystemPrompt(thinkingLevel, hasFiles, hasMultimodal);
+    const userContent = message + (multimodalContext ? `\n\n[업로드된 파일 정보]\n${multimodalContext}` : '');
+
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ];
+
+    // 5. Agent loop
+    const config = THINKING_CONFIGS[thinkingLevel];
+    let iteration = 0;
+    let finalResponse = '';
+
+    while (iteration < config.maxIterations) {
+      iteration++;
+      yield sseEvent({
+        type: 'thinking_start',
+        content: `생각 중... (단계 ${iteration}/${config.maxIterations})`,
+      });
+
+      let rawResponse = '';
+
       try {
-        const sandboxPath = `/tmp/${file.name}`;
-        let uploadSuccess = false;
-
-        const runCmd = async (cmd: string): Promise<string> => {
-          const r = await sandbox.commands.run(cmd, { timeout: 30 });
-          return r.stdout || "";
-        };
-
-        // Strategy 1: write base64 as text → decode with shell
-        try {
-          const b64TmpPath = "/tmp/__upload_b64.tmp";
-          await sandbox.files.write(b64TmpPath, file.base64);
-          await runCmd(
-            `base64 -d ${b64TmpPath} > ${shellQuote(
-              sandboxPath
-            )} && rm -f ${b64TmpPath}`
-          );
-
-          const sizeStr = await runCmd(
-            `stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`
-          );
-          if ((parseInt(sizeStr.trim(), 10) || 0) > 0) {
-            uploadSuccess = true;
-            logger.log(
-              `[upload] success via files.write+decode: ${sandboxPath}`
-            );
+        if (localMode && sandboxWorking) {
+          // Direct model download & inference in sandbox (Python transformers)
+          rawResponse = await runLocalModel(sandbox, messages, thinkingLevel, signal);
+          yield sseEvent({ type: 'text_chunk', content: rawResponse });
+        } else {
+          // HF Inference API with streaming
+          for await (const chunk of callHFModel(messages, hfToken, thinkingLevel, signal)) {
+            rawResponse += chunk;
+            yield sseEvent({ type: 'text_chunk', content: chunk });
           }
-        } catch (e) {
-          logger.log(
-            `[upload] files.write method failed: ${(e as Error).message}`
-          );
-        }
-
-        // Strategy 2: Python base64 decode (fallback)
-        if (!uploadSuccess) {
-          try {
-            const runCode = (code: string) =>
-              sandbox.runCode(code, { language: "python" });
-
-            if (file.base64.length <= 150_000) {
-              await runCode(
-                `import base64\nwith open("${sandboxPath}", "wb") as f:\n    f.write(base64.b64decode("${file.base64}"))\nprint("ok")`
-              );
-            } else {
-              const chunkSize = 150_000;
-              const totalChunks = Math.ceil(file.base64.length / chunkSize);
-              await runCode(`open("/tmp/__b64tmp", "w").close()`);
-              for (let i = 0; i < totalChunks; i++) {
-                const chunk = file.base64.slice(
-                  i * chunkSize,
-                  (i + 1) * chunkSize
-                );
-                await runCode(`open("/tmp/__b64tmp", "a").write("${chunk}")`);
-              }
-              await runCode(
-                `import base64, os\nwith open("/tmp/__b64tmp") as f:\n    d = base64.b64decode(f.read())\nwith open("${sandboxPath}", "wb") as f:\n    f.write(d)\nos.remove("/tmp/__b64tmp")\nprint(len(d))`
-              );
-            }
-
-            const sizeStr = await runCmd(
-              `stat -c %s ${shellQuote(sandboxPath)} 2>/dev/null || echo 0`
-            );
-            if ((parseInt(sizeStr.trim(), 10) || 0) > 0) {
-              uploadSuccess = true;
-              logger.log(`[upload] success via runCode: ${sandboxPath}`);
-            }
-          } catch (e) {
-            logger.log(
-              `[upload] runCode method failed: ${(e as Error).message}`
-            );
-          }
-        }
-
-        if (!uploadSuccess) {
-          logger.error(`[upload] ALL methods failed for ${file.name}`);
-          sandboxWorking = false;
-          break;
         }
       } catch (e) {
-        logger.error(`[upload] failed for ${file.name}:`, (e as Error).message);
-        sandboxWorking = false;
-        break;
-      }
-    }
+        const err = e as Error;
+        logger.error(`[model] iteration ${iteration} error:`, err.message);
 
-    // Tell the AI files are ready — no need to list /tmp
-    if (sandboxWorking && filesToUpload.length > 0) {
-      const fileList = filesToUpload.map((f) => `/tmp/${f.name}`).join(", ");
-      const sysMsg =
-        locale === "zh"
-          ? `\n\n[系统提示：文件已就绪，路径为: ${fileList}。请直接分析和处理，不需要先 list 目录确认。]`
-          : `\n\n[System: Files are ready at: ${fileList}. Start analysis directly — do not list the directory first.]`;
-      message = message + sysMsg;
-    }
-  }
-
-  // ─── Fallback: inline text file content when sandbox unavailable ─────────────
-  if (!sandboxWorking && uploadedFiles.length > 0) {
-    logger.log(
-      "[fallback] sandbox unavailable, inlining text file content into message"
-    );
-    let inlineContent =
-      "\n\n--- FILE CONTENTS (sandbox unavailable, analyze text files below) ---\n";
-    const skippedFiles: string[] = [];
-
-    for (const file of uploadedFiles) {
-      try {
-        const content = Buffer.from(file.base64, "base64");
-        if (!canInlineFallbackFile(file.name, content)) {
-          skippedFiles.push(file.name);
-          continue;
-        }
-        const decoded = content.toString("utf8");
-        inlineContent += `\n### File: ${file.name}\n\`\`\`\n${decoded}\n\`\`\`\n`;
-      } catch {
-        skippedFiles.push(file.name);
-      }
-    }
-
-    if (skippedFiles.length > 0) {
-      inlineContent += `\nSkipped binary or non-text files because sandbox is unavailable: ${skippedFiles.join(
-        ", "
-      )}\n`;
-    }
-    message = message + inlineContent;
-  }
-
-  // ─── Custom MCP tools (suggest_actions + deliver_file) ───────────────────────
-  // SSE side-channel: tool handlers push events; the message loop drains & yields
-  const sseQueue: string[] = [];
-  let suggestActionsCalled = false;
-  let deliverFileCalled = false;
-
-  const customMcpServer = createSdkMcpServer({
-    name: "custom-tools",
-    alwaysLoad: true,
-    tools: [
-      {
-        name: "suggest_actions",
-        description:
-          "Present a list of recommended actions to the user as clickable options. " +
-          "Use this when you have analysed files and want to suggest processing options.",
-        inputSchema: {
-          actions: z
-            .array(
-              z.object({
-                id: z.string().describe("Unique action ID (e.g. action_1)"),
-                emoji: z.string().describe("Emoji icon for the action"),
-                title: z.string().describe("Short title (under 20 chars)"),
-                description: z
-                  .string()
-                  .describe("Brief description of what this action does"),
-              })
-            )
-            .describe("List of suggested actions"),
-        },
-        handler: async ({ actions }: { actions: any[] }) => {
-          suggestActionsCalled = true;
-          sseQueue.push(sseEvent({ type: "suggest_actions", actions }));
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Suggestions have been displayed to the user. Wait for them to choose an action.",
-              },
-            ],
-          };
-        },
-      },
-      {
-        name: "deliver_file",
-        description:
-          "Deliver a processed file to the user for download. " +
-          "Call this after generating an output file (e.g. merged PDF, converted image). " +
-          "The file will be sent as a downloadable link.",
-        inputSchema: {
-          path: z
-            .string()
-            .describe(
-              "Absolute path to the output file in sandbox (e.g. /tmp/report.pdf)"
-            ),
-          filename: z
-            .string()
-            .describe("Display filename for the user (e.g. report.pdf)"),
-          description: z
-            .string()
-            .optional()
-            .describe("Brief description of the file content"),
-        },
-        handler: async ({
-          path,
-          filename,
-          description,
-        }: {
-          path: string;
-          filename: string;
-          description?: string;
-        }) => {
-          deliverFileCalled = true;
-          let base64 = "";
+        // Fallback: local → API
+        if (localMode && sandboxWorking && hfToken) {
+          yield sseEvent({ type: 'thinking_content', content: '로컬 모델 실패, HF API로 전환 중...' });
           try {
-            if (sandbox?.commands?.run) {
-              const r = await sandbox.commands.run(
-                `base64 -w 0 ${shellQuote(path)}`
-              );
-              base64 = (r.stdout || "").trim();
+            for await (const chunk of callHFModel(messages, hfToken, thinkingLevel, signal)) {
+              rawResponse += chunk;
+              yield sseEvent({ type: 'text_chunk', content: chunk });
             }
-          } catch (e) {
-            logger.error(
-              "[deliver_file] failed to read file:",
-              (e as Error).message
-            );
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `Error reading file "${path}": ${(e as Error).message}`,
-                },
-              ],
-            };
+          } catch (e2) {
+            yield sseEvent({ type: 'error_message', content: `모델 호출 실패: ${(e2 as Error).message}` });
+            yield sseEvent({ type: 'thinking_end' });
+            break;
           }
-
-          if (!base64 && sandbox?.commands?.run) {
-            // Fallback: scan /tmp for the most recently created file matching the extension
-            try {
-              const ext = filename.split(".").pop() || "pdf";
-              const scanResult = await sandbox.commands.run(
-                `ls -t /tmp/*.${ext} 2>/dev/null | head -1`
-              );
-              const altPath = scanResult.stdout?.trim();
-              if (altPath && altPath !== path) {
-                logger.log(`[deliver_file] fallback: trying ${altPath}`);
-                const r2 = await sandbox.commands.run(
-                  `base64 -w 0 ${shellQuote(altPath)}`
-                );
-                base64 = (r2.stdout || "").trim();
-              }
-            } catch {
-              // Ignore fallback scan errors
-            }
-          }
-
-          if (!base64) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `File not found or empty: ${path}`,
-                },
-              ],
-            };
-          }
-
-          sseQueue.push(
-            sseEvent({
-              type: "file_output",
-              base64,
-              filename,
-              description: description ?? "",
-            })
-          );
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `File "${filename}" has been delivered to the user for download.`,
-              },
-            ],
-          };
-        },
-      },
-    ],
-  });
-
-  // ─── EdgeOne sandbox MCP server ──────────────────────────────────────────────
-  let sandboxMcpServer: any = null;
-  let edgeoneMcp: any = null;
-  if (
-    sandboxWorking &&
-    typeof context.tools?.toClaudeMcpServer === "function"
-  ) {
-    try {
-      edgeoneMcp = context.tools.toClaudeMcpServer();
-      sandboxMcpServer = createSdkMcpServer({
-        name: edgeoneMcp.name,
-        tools: edgeoneMcp.tools,
-        alwaysLoad: true,
-      });
-      logger.log("[mcp] EdgeOne sandbox MCP server created");
-    } catch (e) {
-      logger.error(
-        "[mcp] failed to create sandbox MCP server:",
-        (e as Error).message
-      );
-    }
-  }
-
-  // Build mcpServers as an object (required by claude-agent-sdk)
-  const mcpServers: Record<string, any> = {
-    "custom-tools": customMcpServer,
-  };
-  if (sandboxMcpServer && edgeoneMcp) {
-    mcpServers[edgeoneMcp.name] = sandboxMcpServer;
-  }
-
-  // ─── Abort controller ────────────────────────────────────────────────────────
-  const abortController = new AbortController();
-  if (signal) {
-    signal.addEventListener("abort", () => abortController.abort(), {
-      once: true,
-    });
-  }
-
-  // ─── Session store ────────────────────────────────────────────────────────────
-  // The Claude Agent SDK exposes `claudeSessionStore()` (camelCase, no arguments).
-  const claudeSessionStore = store?.claudeSessionStore?.() ?? null;
-
-  // ─── Session binding (resume vs new) ─────────────────────────────────────────
-  const sessionBinding = await resolveClaudeSessionBinding(
-    claudeSessionStore,
-    conversationId,
-    cwd
-  );
-
-  // ─── System prompt (skills-based, dynamic) ───────────────────────────────────
-  const systemPrompt = buildSystemPrompt(uploadedFiles, sandboxWorking, locale);
-
-  // ─── Build query options ──────────────────────────────────────────────────────
-  // The Claude Agent SDK spawns the `claude` CLI subprocess with stderr set to
-  // "ignore" by default — that is why a non-zero exit surfaces as a bare
-  // "Claude Code process exited with code 1" with no detail. Wire `stderr` to
-  // our logger so the real CLI diagnostics (MCP handshake errors, unknown
-  // flags, auth issues, etc.) actually reach the dev terminal.
-  const queryOptions: Record<string, any> = {
-    model: resolveModelName(ctxEnv),
-    systemPrompt,
-    cwd,
-    tools: [],
-    // Custom tools must be listed by their full `mcp__<server>__<tool>` name so
-    // the model sees them under the correct `custom-tools` prefix. Without this
-    // the model only sees the edgeone sandbox tools and guesses a wrong prefix
-    // (e.g. mcp__edgeone__suggest_actions → "No such tool available").
-    allowedTools: [
-      "mcp__custom-tools__suggest_actions",
-      "mcp__custom-tools__deliver_file",
-      ...(edgeoneMcp?.allowedTools ?? []),
-    ],
-    // Do not set settingSources / skills options — this project has no .claude/
-    // directory; all skills are baked into the system prompt via _skills.ts.
-    permissionMode: "bypassPermissions",
-    maxTurns: 10,
-    // Emit partial (incremental) assistant messages so we can stream text token
-    // by token. Without this the SDK only emits the FULL assistant message once
-    // per turn → the frontend receives a single text_delta with the entire reply
-    // (no real-time typing effect). With it enabled the SDK also yields
-    // `stream_event` messages carrying Anthropic raw content_block_delta events.
-    includePartialMessages: true,
-    env: {
-      ...ctxEnv,
-      ...collectGatewayEnv(ctxEnv),
-      // The claude CLI needs a writable config directory. In the serverless
-      // runtime there is no writable HOME, so point it at /tmp explicitly.
-      CLAUDE_CONFIG_DIR: "/tmp/claude-agent-sdk",
-      CLAUDE_CODE_TMPDIR: "/tmp",
-    },
-    mcpServers,
-    abortController,
-    // Capture CLI stderr — required to debug CLI exit-1 errors. See SDK
-    // `spawnLocalProcess`: stderr is "ignore" unless either DEBUG_CLAUDE_AGENT_SDK
-    // is set in env OR this callback is provided.
-    stderr: (data: any) => {
-      const text = typeof data === "string" ? data : data?.toString?.() || "";
-      if (text.trim()) logger.error("[claude-stderr]", text.trimEnd());
-    },
-    ...sessionBinding,
-  };
-
-  logger.log(
-    `[query] model=${queryOptions.model}, session=${JSON.stringify(
-      sessionBinding
-    )}`
-  );
-
-  // ─── Helper: extract stdout + stderr from code_interpreter result ───────────
-  function extractCodeInterpreterOutput(raw: string): {
-    stdout: string;
-    stderr: string;
-  } {
-    if (!raw) return { stdout: "", stderr: "" };
-    try {
-      const parsed = JSON.parse(raw);
-      const stdout =
-        (Array.isArray(parsed.logs?.stdout)
-          ? parsed.logs.stdout.join("")
-          : "") ||
-        parsed.stdout ||
-        "";
-      const errorStr =
-        typeof parsed.error === "string"
-          ? parsed.error
-          : parsed.error?.message
-          ? `${parsed.error.name ?? "Error"}: ${parsed.error.message}`
-          : "";
-      const stderr =
-        (Array.isArray(parsed.logs?.stderr)
-          ? parsed.logs.stderr.join("")
-          : "") ||
-        parsed.stderr ||
-        errorStr ||
-        "";
-      return { stdout, stderr };
-    } catch {
-      // Not JSON — return as-is if it looks like plain text output
-      const text = raw.trim().startsWith("{") ? "" : raw;
-      return { stdout: text, stderr: "" };
-    }
-  }
-
-  // ─── SSE generator ────────────────────────────────────────────────────────────
-  async function* generate(): AsyncGenerator<string> {
-    let fullAssistantText = "";
-    let lastMsgType = "";
-
-    // Per-block sent-length tracker to deduplicate incremental text updates
-    const sentTextLenByBlock = new Map<number, number>();
-
-    // Map tool_use block ids → short tool names (for code_output parsing)
-    const toolUseIdToName = new Map<string, string>();
-
-    const q = query({
-      prompt: message,
-      options: queryOptions,
-    });
-
-    try {
-      for await (const msg of q as any) {
-        if (signal?.aborted) break;
-
-        // Drain SSE queue after every message
-        for (const evt of sseQueue.splice(0)) yield evt;
-
-        // Reset text deduplication when a new assistant turn begins
-        if (msg.type === "assistant" && lastMsgType === "user") {
-          sentTextLenByBlock.clear();
-        }
-        lastMsgType = msg.type;
-
-        // ── Partial streaming events: emit incremental text deltas in real time ─
-        // With includePartialMessages enabled, the SDK yields `stream_event`
-        // messages wrapping Anthropic raw streaming events. We forward text
-        // deltas immediately so the UI types out the reply token by token.
-        // sentTextLenByBlock tracks how much of each content block we've already
-        // sent, so the final full `assistant` message (below) won't re-emit it.
-        if (msg.type === "stream_event") {
-          const ev = (msg as any).event;
-          if (ev?.type === "content_block_start") {
-            // New content block begins — reset this block's sent-length counter
-            sentTextLenByBlock.set(ev.index ?? 0, 0);
-          } else if (
-            ev?.type === "content_block_delta" &&
-            ev.delta?.type === "text_delta"
-          ) {
-            const idx = ev.index ?? 0;
-            const text: string = ev.delta.text || "";
-            if (text) {
-              sentTextLenByBlock.set(
-                idx,
-                (sentTextLenByBlock.get(idx) ?? 0) + text.length
-              );
-              fullAssistantText += text;
-              yield sseEvent({ type: "text_delta", delta: text });
-            }
-          }
-          continue;
-        }
-
-        // ── Assistant message: emit text deltas + tool_called events ──────────
-        if (msg.type === "assistant") {
-          const blocks: any[] = msg.message?.content ?? [];
-          for (let idx = 0; idx < blocks.length; idx++) {
-            const block = blocks[idx];
-
-            if (block.type === "text") {
-              const fullText: string = block.text || "";
-              const alreadySent = sentTextLenByBlock.get(idx) ?? 0;
-              if (fullText.length > alreadySent) {
-                const delta = fullText.slice(alreadySent);
-                sentTextLenByBlock.set(idx, fullText.length);
-                fullAssistantText += delta;
-                yield sseEvent({ type: "text_delta", delta });
-              }
-            } else if (block.type === "tool_use") {
-              const rawName: string = block.name || "";
-              // MCP tool names are "mcp__servername__toolname" — extract short name
-              const toolName = rawName.split("__").pop() || rawName;
-              toolUseIdToName.set(block.id, toolName);
-              const inputSummary = JSON.stringify(block.input ?? {}).slice(
-                0,
-                200
-              );
-              logger.log(`[tool_use] ${toolName} | input=${inputSummary}`);
-              yield sseEvent({
-                type: "tool_called",
-                tool: toolName,
-                input: block.input ?? {},
-              });
-            }
-          }
-
-          // ── User message (tool results): emit code_output for code_interpreter ─
-        } else if (msg.type === "user") {
-          // Drain queue again — custom MCP handlers may have just pushed events
-          for (const evt of sseQueue.splice(0)) yield evt;
-
-          const blocks: any[] = msg.message?.content ?? [];
-          for (const block of blocks) {
-            if (block.type === "tool_result") {
-              const toolName = toolUseIdToName.get(block.tool_use_id) || "";
-
-              // Normalize content: may be string, array of blocks, or undefined
-              const contentBlocks: Array<{ type: string; text?: string }> =
-                Array.isArray(block.content)
-                  ? block.content
-                  : typeof block.content === "string"
-                  ? [{ type: "text", text: block.content }]
-                  : [];
-
-              const fullText = contentBlocks
-                .filter((b) => b.type === "text")
-                .map((b) => b.text || "")
-                .join("");
-
-              // Log all tool results for diagnostics (truncated)
-              logger.log(
-                `[tool_result] ${toolName} | len=${
-                  fullText.length
-                } | preview=${fullText.slice(0, 300).replace(/\n/g, "↵")}`
-              );
-
-              if (toolName === "code_interpreter") {
-                const { stdout, stderr } =
-                  extractCodeInterpreterOutput(fullText);
-                if (stdout.trim()) {
-                  yield sseEvent({ type: "code_output", stdout });
-                }
-                if (stderr.trim()) {
-                  yield sseEvent({ type: "code_error", stderr });
-                }
-              }
-            }
-          }
-
-          // ── Result: query complete ─────────────────────────────────────────────
-        } else if (msg.type === "result") {
-          // Drain final queue
-          for (const evt of sseQueue.splice(0)) yield evt;
-          // The Claude Agent SDK does NOT throw on model/CLI failures — instead it
-          // emits a result message with `is_error: true` or `subtype !== 'success'`
-          // (e.g. error_max_turns, error_during_execution). Surface it instead of
-          // silently completing with no output.
-          const subtype: string = msg.subtype || "";
-          const isError: boolean =
-            msg.is_error === true || (subtype !== "" && subtype !== "success");
-          if (isError) {
-            logger.error(
-              "[result] error result:",
-              JSON.stringify(msg).slice(0, 800)
-            );
-            if (!fullAssistantText && !signal?.aborted) {
-              const detail =
-                (typeof msg.result === "string" && msg.result) ||
-                subtype ||
-                "unknown error";
-              yield sseEvent({
-                type: "error_message",
-                content: `Model run failed (${subtype || "error"}): ${detail}`,
-              });
-            }
-          }
+        } else {
+          yield sseEvent({ type: 'error_message', content: `모델 호출 실패: ${err.message}` });
+          yield sseEvent({ type: 'thinking_end' });
           break;
         }
       }
-    } catch (err: any) {
-      logger.error("[query] error:", err?.stack || err);
-      if (!signal?.aborted) {
-        // The SDK's bare "Claude Code process exited with code N" message is
-        // intentionally unhelpful because stderr was suppressed inside the SDK.
-        // Our `stderr` option (see queryOptions) forwards the real CLI output
-        // to logger.error — so check the dev terminal / function logs for the
-        // underlying cause (MCP handshake failure, unknown CLI flag, auth
-        // issue, etc.). Surface a short pointer to the user too.
-        const msg: string = err?.message || String(err);
-        const isSubprocessExit = /Claude Code process exited/i.test(msg);
-        const tail = isSubprocessExit
-          ? "\n\nThe full CLI error has been written to the server logs (look for `[claude-stderr]`). On EdgeOne Makers the gateway credentials are injected automatically; for local dev, make sure your .env values are real (not the .env.example placeholders)."
-          : "";
-        yield sseEvent({ type: "error_message", content: msg + tail });
+
+      if (!rawResponse) {
+        yield sseEvent({ type: 'thinking_content', content: '빈 응답 수신.' });
+        yield sseEvent({ type: 'thinking_end' });
+        break;
+      }
+
+      // Parse thinking and response
+      const { thinking, response } = extractThinking(rawResponse);
+      if (thinking) {
+        yield sseEvent({ type: 'thinking_content', content: thinking });
+      }
+
+      // Parse tool calls
+      const { plainText, toolCalls } = parseToolCalls(response);
+      yield sseEvent({ type: 'thinking_end' });
+
+      if (toolCalls.length === 0) {
+        finalResponse = plainText;
+        break;
+      }
+
+      // Execute tool calls
+      for (const toolCall of toolCalls) {
+        yield sseEvent({
+          type: 'tool_call',
+          tool: toolCall.tool,
+          arguments: toolCall.arguments,
+        });
+
+        const result = await executeTool(toolCall, sandboxWorking ? sandbox : null);
+
+        yield sseEvent({
+          type: 'tool_output',
+          tool: toolCall.tool,
+          output: result.output,
+          success: result.success,
+        });
+
+        if (result.file) {
+          yield sseEvent({
+            type: 'file_download',
+            path: result.file,
+            filename: result.file.split('/').pop() || 'file',
+          });
+        }
+
+        // Feed tool result back to model
+        messages.push({ role: 'assistant', content: rawResponse });
+        messages.push({
+          role: 'user',
+          content: `[도구 결과: ${toolCall.tool}]\n${result.output}`,
+        });
       }
     }
 
-    // ─── Fallback suggest_actions ────────────────────────────────────────────
-    // If AI never called suggest_actions and never delivered a file, auto-emit defaults
-    if (
-      !suggestActionsCalled &&
-      !deliverFileCalled &&
-      uploadedFiles.length > 0
-    ) {
-      logger.log(
-        "[fallback] AI did not call suggest_actions, generating defaults"
-      );
-      yield sseEvent({
-        type: "suggest_actions",
-        actions: buildDefaultActions(uploadedFiles),
-      });
-    }
-
-    yield "data: [DONE]\n\n";
-  }
-
-  return createSSEResponse(generate, signal);
+    // 6. Done
+    yield sseEvent({ type: 'done', content: finalResponse });
+  }, signal);
 }

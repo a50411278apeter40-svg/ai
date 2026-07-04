@@ -5,11 +5,6 @@
  * File path: agents/stop/index.ts → maps to **POST /stop**
  *
  * Aborts the active agent run for the given conversation_id.
- *
- * IMPORTANT: the stop request MUST NOT carry the same `makers-conversation-id`
- * header as the chat request, otherwise EdgeOne sticky-routes /stop to the
- * busy chat instance and abortActiveRun() never reaches the runner.
- * The target conversation_id is therefore passed ONLY via the request body.
  */
 
 const logger = {
@@ -24,7 +19,6 @@ const logger = {
 export async function onRequest(context: any) {
   const { request } = context;
   const body = (request?.body ?? {}) as Record<string, unknown>;
-  // Accept both snake_case and camelCase for backwards compatibility
   const conversationId = (body.conversation_id ?? body.conversationId) as string | undefined;
   logger.log('conversation_id:', conversationId);
 

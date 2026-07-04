@@ -1,114 +1,42 @@
-# Multimodal File Assistant Agent
+# PIXAL 2.0
 
-AI-powered document processing agent that analyzes uploaded files (images, PDFs, CSVs, Word, Excel, text) and performs interactive operations via sandbox execution. Built on the Claude Agent SDK and deployed on EdgeOne Makers.
+PIXAL 2.0 — 정성윤이 만든 AI 에이전트
 
-**Framework:** Claude Agent SDK · **Category:** File Processing · **Language:** TypeScript
+HuggingFace `google/gemma-4-E2B-it-assistant` 모델을 직접 사용하는 멀티모달 AI 에이전트입니다.
 
-[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=multimodal-file-assistant-agent&from=within&fromAgent=1&agentLang=typescript)
+## 기능
 
-## Overview
+- 🧠 **사고 수준 조절**: 낮음/보통/높음/최대 드롭다운으로 AI의 생각 깊이 조절
+- 🎵 **멀티모달**: 이미지, 비디오, 오디오 파일을 텍스트와 함께 제출 (Python 처리)
+- 🔧 **14가지 도구**: 코드 실행, 셸, 파일 작업, 이미지/오디오/비디오 처리, 데이터 분석, PDF 생성, QR 코드, 번역, 파일 변환 등
+- 📊 **아코디언 사고 과정**: 모든 생각 단계를 펼치기/접기 가능한 아코디언으로 표시
+- 📡 **스트리밍 출력**: 모든 응답이 실시간 스트리밍
+- 🐍 **Python 샌드박스**: 모든 패키지 설치, 쓰기 가능한 파일 시스템
+- 🔗 **HuggingFace 직접 연동**: transformers.js 없이 Python transformers 라이브러리 사용
 
-This template turns uploaded files into actionable insights and transformed outputs. It auto-detects file types, loads specialized processing skills, runs Python and shell commands inside a secure sandbox, and delivers generated files back to the user. A dual MCP server architecture exposes both sandbox tools (code interpreter, commands, file I/O) and custom UI tools (action suggestions, file delivery) to the AI agent.
+## 배포 (Tencent Cloud / EdgeOne)
 
-- **Skills-Based Analysis** — Dynamically loads file-type-specific skills (image, CSV, PDF, Word, Excel, text) to tailor the system prompt and available operations.
-- **Sandbox Execution** — Runs Python (Pillow, pandas, matplotlib, pdfplumber, python-docx) and shell commands (ffprobe, ffmpeg) in an EdgeOne sandbox with automatic credential injection.
-- **Interactive Actions** — After analysis, the agent presents clickable action cards via the `suggest_actions` custom tool; processed files are delivered via `deliver_file` as base64-downloadable links.
-- **Session File Cache** — Uploaded files persist across follow-up requests within the same conversation via an in-process cache that re-uploads to the sandbox on every turn.
-- **Bilingual UI** — Full Chinese / English interface with locale-aware AI output.
+1. [console.cloud.tencent.com/edgeone](https://console.cloud.tencent.com/edgeone) 접속
+2. EdgeOne Makers에서 새 프로젝트 생성
+3. 이 GitHub 리포지토리 연결
+4. 환경 변수 설정:
+   - `HUGGING_FACE_HUB_TOKEN`: HuggingFace API 토큰
+   - `HF_LOCAL_MODE` (선택): `true`로 설정 시 샌드박스에서 모델 직접 다운로드 후 실행
 
-## Environment Variables
+## 환경 변수
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `AI_GATEWAY_API_KEY` | Yes | Model gateway API key. Use your Makers Models API Key, or any OpenAI-compatible provider key. |
-| `AI_GATEWAY_BASE_URL` | Yes | Gateway base URL. For Makers Models, use `https://ai-gateway.edgeone.link/v1`. |
-| `AI_GATEWAY_MODEL` | No | Model ID. Defaults to `@makers/deepseek-v4-flash`. |
+| 변수 | 필수 | 설명 |
+|------|------|------|
+| `HUGGING_FACE_HUB_TOKEN` | 예 | HuggingFace API 토큰 |
+| `HF_LOCAL_MODE` | 아니오 | `true` 시 로컬 모델 모드 (직접 다운로드) |
 
-This template follows the OpenAI-compatible standard — point these at Makers Models or any compatible provider.
+## 기술 스택
 
-### How to get AI_GATEWAY_API_KEY
+- **Frontend**: Next.js 16, React 19, Tailwind CSS
+- **Backend**: EdgeOne Makers Functions (TypeScript)
+- **AI Model**: HuggingFace google/gemma-4-E2B-it-assistant
+- **Sandbox**: Python (transformers, PIL, OpenCV, librosa, whisper, pandas, matplotlib)
 
-1. Open the Makers Console (https://edgeone.ai/makers/new?s_url=https://console.tencentcloud.com/edgeone/makers)
-2. Sign in and enable Makers
-3. Go to Makers → Models → API Key and create a key
-4. Copy it into `AI_GATEWAY_API_KEY`
+## 만든 사람
 
-> Built-in models are free within quota and great for validation. For production, bind your own paid provider key (BYOK).
-
-## Local Development
-
-**Prerequisites**
-- Node.js 18+
-- EdgeOne CLI (`npm i -g edgeone`)
-
-```bash
-npm install
-cp .env.example .env
-# Edit .env with your AI_GATEWAY_API_KEY and AI_GATEWAY_BASE_URL
-edgeone makers dev
-```
-
-Open the local observability dashboard at http://localhost:8088/agent-metrics.
-
-## Project Structure
-
-```
-multimodal-file-assistant-agent/
-├── agents/
-│   ├── chat/
-│   │   ├── index.ts       # POST /chat — main agent: session mgmt, file upload, SSE loop
-│   │   ├── _skills.ts     # Dynamic system prompt builder per file type
-│   │   ├── _templates.ts  # PDF generation templates (CJK font support)
-│   │   └── _tools.ts      # Shell quoting, fallback file inlining, default actions
-│   ├── stop/
-│   │   └── index.ts       # POST /stop — abort active run
-│   ├── _model.ts          # Model name resolution, gateway env mapping
-│   └── _shared.ts         # SSE helpers, logger
-├── cloud-functions/
-│   ├── health/
-│   │   └── index.ts       # GET /health — liveness probe
-│   └── _logger.ts         # Shared cloud-function logger
-├── app/                   # Next.js App Router frontend
-├── lib/
-│   └── i18n.tsx           # Chinese / English translations
-└── edgeone.json           # EdgeOne deployment config
-```
-
-Files prefixed with `_` are private modules — not exposed as public routes.
-
-## How It Works
-
-### Runtime Mode
-Files under `agents/` run in **session mode**: requests with the same `conversation_id` are sticky-routed to the same agent instance and the same sandbox. This ensures uploaded files and sandbox state remain available across follow-up messages.
-
-### End-to-End Workflow
-
-1. **File upload** — The frontend encodes files as base64 and POSTs `/chat` with the `makers-conversation-id` HTTP header and body `{ message, files }`.
-2. **Session cache** — Files are merged into a per-conversation in-process cache so they survive across follow-up turns.
-3. **Sandbox write** — The handler writes cached files to `/tmp/` in the EdgeOne sandbox using base64 decode (shell `base64 -d` or Python fallback).
-4. **Skill selection** — The system prompt is built dynamically based on uploaded file types (image, CSV, PDF, Word, Excel, text, or mixed), loading only the relevant skill instructions.
-5. **Agent loop** — The Claude Agent SDK `query()` loop drives the LLM with two MCP servers:
-   - **EdgeOne sandbox MCP** (`context.tools.toClaudeMcpServer()`) exposes `code_interpreter`, `commands`, and file I/O tools.
-   - **Custom tools MCP** exposes `suggest_actions` (UI action cards) and `deliver_file` (downloadable output).
-6. **Tool execution** — The AI may run Python for data analysis, shell commands for media processing, or read/write sandbox files.
-7. **SSE streaming** — Events include `text_delta` (assistant text), `tool_called` (tool start), `code_output` / `code_error` (execution results), `suggest_actions` (clickable options), and `file_output` (base64 download).
-8. **Fallback** — If the sandbox is unavailable, text files are inlined directly into the prompt; binary files are skipped with a notice.
-
-### Key Routes & Parameters
-- `/chat` — Main processing endpoint. Header: `makers-conversation-id: <uuid>`; Body: `{ message, files[] }`.
-- `/stop` — Cancels the active query run for a conversation. Body: `{ conversation_id: <uuid> }` (**do NOT send the `makers-conversation-id` header** — it would sticky-route /stop to the busy chat instance and break abort).
-- `/health` — Simple liveness probe (lives in `cloud-functions/`, not AI-related).
-- `conversation_id` is generated client-side (`crypto.randomUUID()`) and forwarded via the `makers-conversation-id` header; the runtime auto-binds it to `context.conversation_id`.
-
-### Timeouts
-No custom agent timeout is configured; the platform default applies.
-
-## Resources
-
-- [Makers Agents Documentation](https://pages.edgeone.ai/document/agents)
-- [Makers Quick Start](https://pages.edgeone.ai/document/agents-quick-start)
-- [Makers Models](https://pages.edgeone.ai/document/models)
-
-## License
-
-MIT
+**정성윤** — 중학교 1학년 파이썬 프로그래머
