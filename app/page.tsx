@@ -37,7 +37,7 @@ interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  thinkingSteps: ThinkingStep[];
+  thinkingSteps?: ThinkingStep[];
   files?: FileItem[];
   fileDownloads?: Array<{ path: string; filename: string }>;
   isStreaming: boolean;
@@ -464,6 +464,26 @@ export default function HomePage() {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const updateAssistant = (updates: Partial<ChatMessage>) => {
+      setMessages(prev => prev.map(m =>
+        m.id === `assistant-${msgId}` ? { ...m, ...updates } : m
+      ));
+    };
+
+    const allThinkingSteps: ThinkingStep[] = [];
+
+    const addThinkingStep = (step: ThinkingStep) => {
+      allThinkingSteps.push(step);
+      updateAssistant({ thinkingSteps: [...allThinkingSteps] });
+    };
+
+    const updateLastThinkingStep = (updates: Partial<ThinkingStep>) => {
+      if (allThinkingSteps.length > 0) {
+        Object.assign(allThinkingSteps[allThinkingSteps.length - 1], updates);
+        updateAssistant({ thinkingSteps: [...allThinkingSteps] });
+      }
+    };
+
     try {
       // Prepare files for API
       const apiFiles = userFiles.map(f => ({
@@ -495,25 +515,6 @@ export default function HomePage() {
       let buffer = '';
       let accumulatedText = '';
       let currentThinkingStep: ThinkingStep | null = null;
-      const allThinkingSteps: ThinkingStep[] = [];
-
-      const updateAssistant = (updates: Partial<ChatMessage>) => {
-        setMessages(prev => prev.map(m =>
-          m.id === `assistant-${msgId}` ? { ...m, ...updates } : m
-        ));
-      };
-
-      const addThinkingStep = (step: ThinkingStep) => {
-        allThinkingSteps.push(step);
-        updateAssistant({ thinkingSteps: [...allThinkingSteps] });
-      };
-
-      const updateLastThinkingStep = (updates: Partial<ThinkingStep>) => {
-        if (allThinkingSteps.length > 0) {
-          Object.assign(allThinkingSteps[allThinkingSteps.length - 1], updates);
-          updateAssistant({ thinkingSteps: [...allThinkingSteps] });
-        }
-      };
 
       while (true) {
         const { done, value } = await reader.read();
@@ -741,9 +742,9 @@ export default function HomePage() {
               {msg.role === 'assistant' && (
                 <div className="space-y-3">
                   {/* Thinking steps (accordion) */}
-                  {msg.thinkingSteps.length > 0 && (
+                  {(msg.thinkingSteps?.length ?? 0) > 0 && (
                     <ThinkingSection
-                      steps={msg.thinkingSteps}
+                      steps={msg.thinkingSteps ?? []}
                       isLive={msg.isStreaming}
                       isDark={isDark}
                       title="생각 과정"
@@ -782,7 +783,7 @@ export default function HomePage() {
                   )}
 
                   {/* Loading state with no content yet */}
-                  {msg.isStreaming && !msg.content && msg.thinkingSteps.length === 0 && (
+                  {msg.isStreaming && !msg.content && (msg.thinkingSteps?.length ?? 0) === 0 && (
                     <div className="flex items-center gap-2">
                       <span className="w-4 h-4 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
                       <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>대기 중...</span>
