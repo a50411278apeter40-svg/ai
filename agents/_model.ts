@@ -1,16 +1,25 @@
 /**
- * Model & HuggingFace Configuration for PIXAL2.0
- * ===============================================
- * Uses google/gemma-4-E2B-it-assistant from HuggingFace.
- * Supports both HF Inference API (remote) and local sandbox download (direct).
- * NO transformers.js — Python transformers library only (in sandbox).
+ * Model Configuration for PIXAL2.0
+ * ===================================
+ * IMPORTANT model-id note:
+ *   "google/gemma-4-E2B-it-assistant" is NOT a standalone chat model — it's a
+ *   Multi-Token-Prediction (MTP) "draft" model used only for speculative
+ *   decoding, and must be paired with the real target model via
+ *   `assistant_model=` in `.generate()`. Using it alone produces garbage.
+ *   The real chat/multimodal model is "google/gemma-4-E2B-it".
+ *
+ * This project ALWAYS runs the model locally via the Python `transformers`
+ * library inside the EdgeOne sandbox (no remote HF Inference API calls).
+ * A small persistent Python HTTP server is started inside the sandbox so the
+ * ~5B-parameter model is loaded into memory once per session instead of on
+ * every single chat turn (see agents/chat/_local_model.ts).
  */
 
-/** HuggingFace model identifier */
-export const HF_MODEL_ID = 'google/gemma-4-E2B-it-assistant';
+/** The real Gemma 4 E2B instruction-tuned multimodal model (text+image+audio) */
+export const HF_MODEL_ID = 'google/gemma-4-E2B-it';
 
-/** HuggingFace Inference API base URL */
-export const HF_API_BASE = 'https://router.huggingface.co';
+/** Optional speculative-decoding draft model — speeds up generation, never used alone */
+export const HF_ASSISTANT_MODEL_ID = 'google/gemma-4-E2B-it-assistant';
 
 /** Thinking level configurations — controls reasoning depth, iterations, tokens */
 export type ThinkingLevel = 'low' | 'medium' | 'high' | 'max';
@@ -54,17 +63,16 @@ export const THINKING_CONFIGS: Record<ThinkingLevel, ThinkingConfig> = {
   },
 };
 
-/** Get HuggingFace API token from environment */
+/** Get HuggingFace API token from environment.
+ * Gemma models are gated on the Hub, so this token is still required —
+ * it's used to `huggingface_hub.login()` before downloading the weights,
+ * NOT for calling any remote inference API. */
 export function getHFToken(env?: Record<string, string | undefined>): string {
   return env?.HUGGING_FACE_HUB_TOKEN || env?.HF_TOKEN || '';
 }
 
-/** Check if local model mode is enabled (download & run in sandbox) */
-export function isLocalMode(env?: Record<string, string | undefined>): boolean {
-  return env?.HF_LOCAL_MODE === 'true';
-}
-
-/** Build the HF Inference API URL for chat completions */
-export function getChatCompletionsURL(): string {
-  return `${HF_API_BASE}/v1/chat/completions`;
+/** Whether to use the MTP assistant model for speculative decoding speedup.
+ * Defaults to true; set HF_USE_ASSISTANT=false to disable if it causes issues. */
+export function useAssistantModel(env?: Record<string, string | undefined>): boolean {
+  return env?.HF_USE_ASSISTANT !== 'false';
 }
