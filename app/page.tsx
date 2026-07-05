@@ -34,6 +34,15 @@ interface ThinkingStep {
   toolSuccess?: boolean;
 }
 
+/** Real (not animated/fake) local-model download & load progress */
+interface ModelDownloadProgress {
+  phase: 'starting' | 'checking' | 'downloading' | 'loading' | 'ready' | 'error' | 'unknown';
+  percent: number;
+  message: string;
+  downloadedBytes?: number;
+  totalBytes?: number;
+}
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -43,6 +52,7 @@ interface ChatMessage {
   fileDownloads?: Array<{ path: string; filename: string }>;
   isStreaming: boolean;
   thinkingLevel: ThinkingLevel;
+  downloadProgress?: ModelDownloadProgress | null;
 }
 
 /** Logged-in user (no real auth — just stored profile info) */
@@ -168,6 +178,65 @@ function AccordionStep({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ============ Real Download Progress Bar ============
+
+function formatMB(bytes?: number): string {
+  if (!bytes && bytes !== 0) return '';
+  return `${Math.round(bytes / (1024 * 1024)).toLocaleString()}MB`;
+}
+
+function DownloadProgressBar({
+  progress,
+  isDark,
+}: {
+  progress: ModelDownloadProgress;
+  isDark: boolean;
+}) {
+  const percent = Math.max(0, Math.min(100, progress.percent ?? 0));
+  const phaseLabel: Record<string, string> = {
+    starting: '시작 중',
+    checking: '모델 크기 확인',
+    downloading: '다운로드 중',
+    loading: '메모리 로딩',
+    ready: '완료',
+    error: '오류',
+    unknown: '확인 중',
+  };
+
+  return (
+    <div className={`rounded-xl border p-3.5 space-y-2 ${
+      isDark ? 'bg-gray-900/40 border-gray-700/40' : 'bg-gray-50 border-gray-200'
+    }`}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-3.5 h-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin flex-shrink-0" />
+          <span className={`text-xs font-medium truncate ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+            google/gemma-4-E2B-it 로컬 모델 · {phaseLabel[progress.phase] || progress.phase}
+          </span>
+        </div>
+        <span className={`text-xs font-semibold tabular-nums flex-shrink-0 ${isDark ? 'text-blue-300' : 'text-blue-600'}`}>
+          {percent.toFixed(1)}%
+        </span>
+      </div>
+
+      {/* Real progress bar — width is driven directly by actual bytes-on-disk / real repo size */}
+      <div className={`h-2 w-full rounded-full overflow-hidden ${isDark ? 'bg-gray-800' : 'bg-gray-200'}`}>
+        <div
+          className="h-full rounded-full bg-blue-500 transition-[width] duration-500 ease-out"
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+
+      <div className={`flex items-center justify-between text-[11px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+        <span className="truncate">{progress.message}</span>
+        {typeof progress.downloadedBytes === 'number' && typeof progress.totalBytes === 'number' && progress.totalBytes > 0 && (
+          <span className="flex-shrink-0 ml-2">{formatMB(progress.downloadedBytes)} / {formatMB(progress.totalBytes)}</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -595,6 +664,21 @@ export default function HomePage() {
               case 'ping':
                 break;
 
+              case 'model_download_progress': {
+                updateAssistant({
+                  downloadProgress: event.ready
+                    ? null
+                    : {
+                        phase: event.phase || 'unknown',
+                        percent: typeof event.percent === 'number' ? event.percent : 0,
+                        message: event.message || '',
+                        downloadedBytes: event.downloadedBytes,
+                        totalBytes: event.totalBytes,
+                      },
+                });
+                break;
+              }
+
               case 'thinking_start': {
                 if (currentThinkingStep) {
                   // Close previous step
@@ -652,7 +736,7 @@ export default function HomePage() {
 
               case 'text_chunk': {
                 accumulatedText += event.content || '';
-                updateAssistant({ content: accumulatedText });
+                updateAssistant({ content: accumulatedText, downloadProgress: null });
                 break;
               }
 
@@ -850,6 +934,11 @@ export default function HomePage() {
               {/* Assistant message */}
               {msg.role === 'assistant' && (
                 <div className="space-y-3">
+                  {/* Real local-model download/loading progress bar */}
+                  {msg.downloadProgress && (
+                    <DownloadProgressBar progress={msg.downloadProgress} isDark={isDark} />
+                  )}
+
                   {/* Thinking steps (accordion) */}
                   {(msg.thinkingSteps?.length ?? 0) > 0 && (
                     <ThinkingSection
@@ -892,7 +981,7 @@ export default function HomePage() {
                   )}
 
                   {/* Loading state with no content yet */}
-                  {msg.isStreaming && !msg.content && (msg.thinkingSteps?.length ?? 0) === 0 && (
+                  {msg.isStreaming && !msg.content && (msg.thinkingSteps?.length ?? 0) === 0 && !msg.downloadProgress && (
                     <div className="flex items-center gap-2">
                       <span className="w-4 h-4 rounded-full border-2 border-blue-400 border-t-transparent animate-spin" />
                       <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>대기 중...</span>

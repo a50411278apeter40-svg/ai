@@ -27,7 +27,10 @@ import {
   ToolCall,
 } from "./_tools";
 import {
-  ensureModelServer,
+  startModelServer,
+  getModelServerStatus,
+  markServerReady,
+  isServerKnownReady,
   generateWithLocalModel,
   LocalMessage,
   ContentPart,
@@ -244,23 +247,51 @@ export async function onRequest(context: any) {
       return;
     }
 
-    // 2. Ensure the persistent local model server (loads google/gemma-4-E2B-it once)
-    yield sseEvent({ type: 'thinking_start', content: '로컬 AI 모델 서버 확인 중...' });
-    const serverStatus = await ensureModelServer(
-      sandbox,
-      conversationId,
-      hfToken,
-      useAssistant,
-      (msg) => {
-        // best-effort progress ping; consumed below via polling loop instead
-      }
-    );
-    yield sseEvent({ type: 'thinking_content', content: serverStatus.message });
-    logMessage('system', serverStatus.message, { type: 'model_server' });
-    yield sseEvent({ type: 'thinking_end' });
+    // 2. Ensure the persistent local model server is up — with a REAL progress bar.
+    //    Progress % comes from actual bytes on disk vs. the real HF repo size
+    //    (read from progress.json written by the Python server script), not a
+    //    fake/animated bar.
+    let serverReady = isServerKnownReady(conversationId);
 
-    if (!serverStatus.ready) {
-      const errMsg = `로컬 모델 서버를 시작하지 못했습니다: ${serverStatus.message}`;
+    if (!serverReady) {
+      await startModelServer(sandbox, conversationId, hfToken, useAssistant);
+
+      const maxTicks = 200; // ~200 * 3s ≈ 10 minutes ceiling
+      let lastPercent = -1;
+      for (let tick = 0; tick < maxTicks; tick++) {
+        const status = await getModelServerStatus(sandbox);
+
+        yield sseEvent({
+          type: 'model_download_progress',
+          phase: status.phase,
+          percent: status.percent,
+          message: status.message,
+          downloadedBytes: status.downloadedBytes,
+          totalBytes: status.totalBytes,
+          ready: status.ready,
+        });
+
+        if (status.percent !== lastPercent || status.ready) {
+          logMessage('system', status.message, {
+            type: 'model_download_progress',
+            phase: status.phase,
+            percent: status.percent,
+          });
+          lastPercent = status.percent;
+        }
+
+        if (status.ready) {
+          markServerReady(conversationId);
+          serverReady = true;
+          break;
+        }
+
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+
+    if (!serverReady) {
+      const errMsg = '로컬 모델 서버가 제한 시간 내에 준비되지 않았습니다. 잠시 후 다시 시도해주세요.';
       yield sseEvent({ type: 'error_message', content: errMsg });
       logMessage('system', errMsg, { type: 'error' });
       yield sseEvent({ type: 'done', content: '' });

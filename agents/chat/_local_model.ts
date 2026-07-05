@@ -4,13 +4,13 @@
  * Runs the model 100% locally, inside the EdgeOne sandbox, via the Python
  * `transformers` library. There is NO call to any remote inference API.
  *
- * Because a ~multi-billion-parameter model would be far too slow to
- * download + load into memory on every single chat message, this module
- * starts a small persistent Python HTTP server INSIDE the sandbox the first
- * time a conversation needs it. The model is loaded into memory once; every
- * following turn in that same session just sends a request to
- * `http://127.0.0.1:8765` (loopback inside the sandbox — the Node backend
- * never talks to it from outside).
+ * A small persistent Python HTTP server is started inside the sandbox the
+ * first time a conversation needs it, so the model is loaded into memory
+ * once per session instead of on every chat turn. While it's downloading
+ * weights, the script writes REAL progress (bytes actually on disk vs. the
+ * real total repo size from the HF Hub API) to a progress.json file that the
+ * Node backend polls and forwards to the frontend as `model_download_progress`
+ * SSE events — this drives an actual (not fake/animated) progress bar.
  *
  * Model input format follows the official Gemma 4 usage:
  *   processor.apply_chat_template(messages, tokenize=True, return_dict=True,
@@ -25,6 +25,7 @@ const MODEL_SERVER_PORT = 8765;
 const WORK_DIR = '/tmp/pixal_work';
 const SERVER_SCRIPT_PATH = `${WORK_DIR}/model_server.py`;
 const SERVER_LOG_PATH = `${WORK_DIR}/model_server.log`;
+const PROGRESS_PATH = `${WORK_DIR}/progress.json`;
 const REQUEST_FILE_PATH = `${WORK_DIR}/request.json`;
 
 export type ContentPart =
@@ -35,6 +36,15 @@ export type ContentPart =
 export interface LocalMessage {
   role: 'system' | 'user' | 'assistant';
   content: string | ContentPart[];
+}
+
+export interface ModelServerStatus {
+  ready: boolean;
+  phase: 'starting' | 'checking' | 'downloading' | 'loading' | 'ready' | 'error' | 'unknown';
+  percent: number;
+  message: string;
+  downloadedBytes?: number;
+  totalBytes?: number;
 }
 
 interface Sandbox {
@@ -54,11 +64,27 @@ function shellEscape(value: string): string {
 /** Builds the Python HTTP server script that stays resident for the session */
 function buildServerScript(useAssistant: boolean): string {
   return `
-import os, sys, json, traceback
+import os, sys, json, time, threading, traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-os.environ.setdefault("HF_HOME", "${WORK_DIR}/hf_cache")
-os.environ.setdefault("TRANSFORMERS_CACHE", "${WORK_DIR}/hf_cache")
+WORK_DIR = "${WORK_DIR}"
+HF_HOME = WORK_DIR + "/hf_cache"
+os.environ.setdefault("HF_HOME", HF_HOME)
+os.environ.setdefault("TRANSFORMERS_CACHE", HF_HOME)
+PROGRESS_PATH = "${PROGRESS_PATH}"
+
+
+def write_progress(data):
+    try:
+        tmp = PROGRESS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, PROGRESS_PATH)
+    except Exception:
+        pass
+
+
+write_progress({"phase": "starting", "percent": 0, "message": "\ucd08\uae30\ud654 \uc911..."})
 
 HF_TOKEN = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
 if HF_TOKEN:
@@ -68,17 +94,81 @@ if HF_TOKEN:
     except Exception as e:
         print(f"[model_server] HF login warning: {e}", file=sys.stderr, flush=True)
 
-import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from huggingface_hub import HfApi, snapshot_download
 
 MODEL_ID = "${HF_MODEL_ID}"
 ASSISTANT_MODEL_ID = "${HF_ASSISTANT_MODEL_ID}"
 USE_ASSISTANT = ${useAssistant ? 'True' : 'False'}
+REPOS = [MODEL_ID] + ([ASSISTANT_MODEL_ID] if USE_ASSISTANT else [])
 
-print("[model_server] loading processor for " + MODEL_ID + " ...", flush=True)
+
+def repo_total_bytes(repo_id):
+    try:
+        info = HfApi().model_info(repo_id, files_metadata=True)
+        return sum((s.size or 0) for s in (info.siblings or []) if getattr(s, "size", None))
+    except Exception as e:
+        print(f"[model_server] size lookup failed for {repo_id}: {e}", file=sys.stderr, flush=True)
+        return 0
+
+
+def cache_dir_bytes(repo_id):
+    safe = "models--" + repo_id.replace("/", "--")
+    blobs_dir = os.path.join(HF_HOME, "hub", safe, "blobs")
+    total = 0
+    if os.path.isdir(blobs_dir):
+        for root, _dirs, files in os.walk(blobs_dir):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    return total
+
+
+write_progress({"phase": "checking", "percent": 0, "message": "\ubaa8\ub378 \ud06c\uae30 \ud655\uc778 \uc911..."})
+repo_sizes = {r: repo_total_bytes(r) for r in REPOS}
+total_bytes = sum(repo_sizes.values()) or 1
+
+_stop_monitor = False
+
+
+def monitor_loop():
+    while not _stop_monitor:
+        downloaded = sum(cache_dir_bytes(r) for r in REPOS)
+        percent = min(99.0, round(downloaded / total_bytes * 100, 1))
+        mb_done = downloaded // (1024 * 1024)
+        mb_total = total_bytes // (1024 * 1024)
+        write_progress({
+            "phase": "downloading",
+            "percent": percent,
+            "downloadedBytes": downloaded,
+            "totalBytes": total_bytes,
+            "message": f"\ub2e4\uc6b4\ub85c\ub4dc \uc911... {mb_done}MB / {mb_total}MB ({percent}%)",
+        })
+        time.sleep(2)
+
+
+monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+monitor_thread.start()
+
+write_progress({
+    "phase": "downloading", "percent": 0, "totalBytes": total_bytes,
+    "message": "\ub2e4\uc6b4\ub85c\ub4dc \uc2dc\uc791...",
+})
+
+try:
+    for repo in REPOS:
+        snapshot_download(repo_id=repo)
+finally:
+    _stop_monitor = True
+    monitor_thread.join(timeout=5)
+
+write_progress({"phase": "loading", "percent": 100, "message": "\ubaa8\ub378\uc744 \uba54\ubaa8\ub9ac\uc5d0 \ub85c\ub529 \uc911..."})
+
+import torch
+from transformers import AutoProcessor, AutoModelForImageTextToText
+
 processor = AutoProcessor.from_pretrained(MODEL_ID, padding_side="left")
-
-print("[model_server] loading model weights (first run can take a while)...", flush=True)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
     dtype=torch.bfloat16,
@@ -99,6 +189,7 @@ if USE_ASSISTANT:
         print(f"[model_server] assistant model unavailable, continuing without it: {e}", flush=True)
         assistant_model = None
 
+write_progress({"phase": "ready", "percent": 100, "message": "\ubaa8\ub378 \uc900\ube44 \uc644\ub8cc."})
 print("[model_server] READY", flush=True)
 
 
@@ -182,7 +273,7 @@ server.serve_forever()
 `;
 }
 
-/** In-process cache: which conversations already have a healthy server */
+/** In-process cache: which conversations already have a known-healthy server */
 const _serverEnsured = new Set<string>();
 
 async function runCmd(sandbox: Sandbox, cmd: string, timeout = 15): Promise<string> {
@@ -203,60 +294,74 @@ async function isServerHealthy(sandbox: Sandbox): Promise<boolean> {
   return out.includes('"status"') && out.includes('ok');
 }
 
-/**
- * Ensure the persistent local-model Python server is running inside the
- * sandbox. First call for a session starts it and waits (polling) for the
- * model to finish loading; later calls are a cheap health check.
- */
-export async function ensureModelServer(
+/** Start the model server in the background if it isn't already running. Returns immediately. */
+export async function startModelServer(
   sandbox: Sandbox,
   conversationId: string,
   hfToken: string,
-  useAssistant: boolean,
-  onProgress?: (message: string) => void
-): Promise<{ ready: boolean; message: string }> {
-  if (!sandbox?.commands || !sandbox?.files) {
-    return { ready: false, message: '샌드박스 명령/파일 API를 사용할 수 없습니다.' };
-  }
+  useAssistant: boolean
+): Promise<void> {
+  if (!sandbox?.commands || !sandbox?.files) return;
 
-  if (conversationId && _serverEnsured.has(conversationId) && (await isServerHealthy(sandbox))) {
-    return { ready: true, message: '모델 서버 재사용 중.' };
-  }
+  if (conversationId && _serverEnsured.has(conversationId)) return;
   if (await isServerHealthy(sandbox)) {
     if (conversationId) _serverEnsured.add(conversationId);
-    return { ready: true, message: '모델 서버 이미 실행 중.' };
+    return;
   }
 
-  await runCmd(sandbox, `mkdir -p ${WORK_DIR} && chmod 777 ${WORK_DIR}`);
+  // Already starting? (progress.json exists and is recent-ish) — don't relaunch.
+  const existing = await runCmd(sandbox, `cat ${PROGRESS_PATH} 2>/dev/null || true`, 8);
+  const pidCheck = await runCmd(sandbox, `pgrep -f "${SERVER_SCRIPT_PATH}" || true`, 8);
+  if (existing.trim() && pidCheck.trim()) {
+    return; // a launch is already in progress from a previous call
+  }
+
+  await runCmd(sandbox, `mkdir -p ${WORK_DIR} && chmod 777 ${WORK_DIR} && rm -f ${PROGRESS_PATH}`);
   await sandbox.files.write(SERVER_SCRIPT_PATH, buildServerScript(useAssistant));
 
   const tokenEnv = hfToken ? `HUGGING_FACE_HUB_TOKEN=${shellEscape(hfToken)} ` : '';
-
-  onProgress?.(`로컬 모델 서버 시작 중 (${HF_MODEL_ID} 다운로드/로딩 — 처음엔 몇 분 걸릴 수 있음)...`);
 
   await runCmd(
     sandbox,
     `cd ${WORK_DIR} && ${tokenEnv}nohup python3 ${SERVER_SCRIPT_PATH} > ${SERVER_LOG_PATH} 2>&1 & disown; echo started`,
     10
   );
+}
 
-  // Poll — first run downloads several GB of weights, can take minutes.
-  const maxAttempts = 60; // up to ~10 minutes
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise(r => setTimeout(r, 10_000));
-    if (await isServerHealthy(sandbox)) {
-      if (conversationId) _serverEnsured.add(conversationId);
-      return { ready: true, message: '모델 서버 준비 완료.' };
-    }
-    if (i % 3 === 2) {
-      const log = await runCmd(sandbox, `tail -n 3 ${SERVER_LOG_PATH} 2>/dev/null || true`, 8);
-      const lastLine = log.trim().split('\n').filter(Boolean).pop();
-      if (lastLine) onProgress?.(`모델 로딩 중... (${lastLine})`);
-    }
+/** One-shot read of the current real download/loading status. */
+export async function getModelServerStatus(sandbox: Sandbox): Promise<ModelServerStatus> {
+  if (await isServerHealthy(sandbox)) {
+    return { ready: true, phase: 'ready', percent: 100, message: '모델 서버 준비 완료.' };
   }
 
-  const log = await runCmd(sandbox, `tail -n 40 ${SERVER_LOG_PATH} 2>/dev/null || true`, 8);
-  return { ready: false, message: `모델 서버가 제한 시간 내에 준비되지 않았습니다.\n${log}` };
+  const raw = await runCmd(sandbox, `cat ${PROGRESS_PATH} 2>/dev/null || true`, 8);
+  if (!raw.trim()) {
+    return { ready: false, phase: 'starting', percent: 0, message: '모델 서버 시작 중...' };
+  }
+
+  try {
+    const parsed = JSON.parse(raw.trim());
+    return {
+      ready: false,
+      phase: parsed.phase || 'unknown',
+      percent: typeof parsed.percent === 'number' ? parsed.percent : 0,
+      message: parsed.message || '진행 중...',
+      downloadedBytes: parsed.downloadedBytes,
+      totalBytes: parsed.totalBytes,
+    };
+  } catch {
+    return { ready: false, phase: 'unknown', percent: 0, message: '상태 확인 중...' };
+  }
+}
+
+/** Mark a conversation's server as known-healthy (call once ready() is observed) */
+export function markServerReady(conversationId: string): void {
+  if (conversationId) _serverEnsured.add(conversationId);
+}
+
+/** Quick cached check — true if we already know this conversation's server is healthy */
+export function isServerKnownReady(conversationId: string): boolean {
+  return Boolean(conversationId && _serverEnsured.has(conversationId));
 }
 
 /** Send one generation request to the running local model server. */
